@@ -1,9 +1,6 @@
 # POC — Pipeline de Paiements en Temps Réel
 
-> Pipeline de streaming temps réel déployé sur Kubernetes (Minikube) via Terraform.  
-> Architecture : **Producer Python** → **Apache Kafka** → **Apache Flink** → **MinIO**
 
----
 
 ## Table des matières
 
