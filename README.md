@@ -27,67 +27,65 @@ Toute l'infrastructure est provisionnée automatiquement via un seul script Bash
 
 ## Architecture
 
-## Architecture
-
 ```mermaid
 flowchart TB
-    subgraph LOCAL["💻 Environnement Local"]
-        P[Producer Python\n(CSV Kaggle)]
+    subgraph LOCAL["Local"]
+        P["Producer Python (CSV Kaggle)"]
     end
 
-    subgraph K8S["☸️ Cluster Kubernetes (Minikube)"]
+    subgraph K8S["Kubernetes (Minikube)"]
 
-        subgraph ING["📥 Namespace: ingestion"]
-            K[Kafka (Strimzi)]
-            T1[Topic: payments]
-            T2[Topic: payments.dlq]
+        subgraph ING["Ingestion"]
+            K["Kafka Cluster"]
+            T1["Topic: payments"]
+            T2["Topic: payments.dlq"]
         end
 
-        subgraph PROC["⚙️ Namespace: traitement"]
-            FJ[JobManager]
-            FT1[TaskManager 1]
-            FT2[TaskManager 2]
+        subgraph PROC["Traitement"]
+            JM["JobManager"]
+            TM1["TaskManager 1"]
+            TM2["TaskManager 2"]
         end
 
-        subgraph STOR["💾 Namespace: stockage"]
-            M[MinIO]
-            B[Bucket: rt-payments]
+        subgraph STOR["Stockage"]
+            M["MinIO"]
+            B["Bucket: rt-payments"]
         end
-
     end
 
-    P -->|JSON chiffré| K
+    P -->|JSON| K
     K --> T1
-    T1 --> FJ
-    FJ --> FT1
-    FJ --> FT2
+    T1 --> JM
+    JM --> TM1
+    JM --> TM2
 
-    FT1 -->|données valides| M
-    FT2 -->|données valides| M
+    TM1 -->|OK| M
+    TM2 -->|OK| M
 
-    FT1 -->|erreurs| T2
-    FT2 -->|erreurs| T2
+    TM1 -->|Error| T2
+    TM2 -->|Error| T2
 
     M --> B
 ```
-### Flux de données
+
+---
+
+## 🔄 Flux de données
 
 ```mermaid
 flowchart LR
 
-    A[CSV Kaggle] --> B[Producer Python]
+    A["CSV Dataset"] --> B["Producer Python"]
+    B -->|Encrypt JSON| C["Kafka: payments"]
 
-    B -->|JSON chiffré| C[Kafka - Topic: payments]
+    C --> D["Flink: Decrypt"]
+    D --> E["Flink: Validate"]
 
-    C --> D[Flink Job: Decrypt]
-    D --> E[Flink Job: Validate]
+    E -->|Valid| F["Flink: Enrich"]
+    E -->|Invalid| G["DLQ"]
 
-    E -->|Valide| F[Flink Job: Enrich]
-    E -->|Invalide| G[Topic: DLQ]
-
-    F --> H[Flink Job: Write]
-
-    H --> I[MinIO Bucket\nrt-payments]
+    F --> H["Flink: Write"]
+    H --> I["MinIO Bucket"]
 ```
 
 ---
