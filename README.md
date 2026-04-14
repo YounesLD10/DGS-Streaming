@@ -19,7 +19,7 @@
 
 ## Vue d'ensemble
 
-Ce POC simule un pipeline de traitement de transactions de paiement en temps réel. Des données CSV (transactions Kaggle) sont lues par un **producer Python**, publiées sur **Kafka**, traitées par **Apache Flink** (déchiffrement, validation, enrichissement), puis stockées dans **MinIO** (stockage objet compatible S3).
+Ce POC simule un pipeline de traitement de transactions de paiement en temps réel. Des données CSV (transactions) sont lues par un **producer Python**, publiées sur **Kafka**, traitées par **Apache Flink** (déchiffrement, validation, enrichissement), puis stockées dans **MinIO** (stockage objet compatible S3).
 
 Toute l'infrastructure est provisionnée automatiquement via un seul script Bash qui génère et applique de la configuration **Terraform** + des manifests **Kubernetes**.
 
@@ -30,7 +30,7 @@ Toute l'infrastructure est provisionnée automatiquement via un seul script Bash
 ```mermaid
 flowchart TB
     subgraph LOCAL["Local"]
-        P["Producer Python (CSV Kaggle)"]
+        P["Producer Python (CSV)"]
     end
 
     subgraph K8S["Kubernetes (Minikube)"]
