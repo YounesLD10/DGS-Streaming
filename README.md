@@ -27,53 +27,67 @@ Toute l'infrastructure est provisionnée automatiquement via un seul script Bash
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  CLUSTER MINIKUBE (Kubernetes v1.29)                            │
-│                                                                 │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐  │
-│  │ ns: ingestion    │  │ ns: traitement   │  │ ns: stockage │  │
-│  │                  │  │                  │  │              │  │
-│  │  Kafka (Strimzi) │  │  Flink Operator  │  │    MinIO     │  │
-│  │  ┌─────────────┐ │  │  ┌────────────┐  │  │  ┌────────┐  │  │
-│  │  │   Broker    │─┼──┼─▶│ JobManager │  │  │  │bucket  │  │  │
-│  │  │   :9092     │ │  │  └────────────┘  │  │  │rt-pay. │  │  │
-│  │  └─────────────┘ │  │  ┌────────────┐  │  │  └────────┘  │  │
-│  │  topic: payments │  │  │TaskManager │──┼──┼─▶  :9000     │  │
-│  │  topic: DLQ      │  │  │TaskManager │  │  │              │  │
-│  └──────────────────┘  │  └────────────┘  │  └──────────────┘  │
-│                        └──────────────────┘                     │
-└─────────────────────────────────────────────────────────────────┘
-         ▲
-         │ :9094 (NodePort)
-         │
-┌─────────────────┐
-│  Producer Python │  ← lit un CSV de transactions
-│  (local)         │
-└─────────────────┘
-```
+## Architecture
 
+```mermaid
+flowchart TB
+    subgraph LOCAL["💻 Environnement Local"]
+        P[Producer Python\n(CSV Kaggle)]
+    end
+
+    subgraph K8S["☸️ Cluster Kubernetes (Minikube)"]
+
+        subgraph ING["📥 Namespace: ingestion"]
+            K[Kafka (Strimzi)]
+            T1[Topic: payments]
+            T2[Topic: payments.dlq]
+        end
+
+        subgraph PROC["⚙️ Namespace: traitement"]
+            FJ[JobManager]
+            FT1[TaskManager 1]
+            FT2[TaskManager 2]
+        end
+
+        subgraph STOR["💾 Namespace: stockage"]
+            M[MinIO]
+            B[Bucket: rt-payments]
+        end
+
+    end
+
+    P -->|JSON chiffré| K
+    K --> T1
+    T1 --> FJ
+    FJ --> FT1
+    FJ --> FT2
+
+    FT1 -->|données valides| M
+    FT2 -->|données valides| M
+
+    FT1 -->|erreurs| T2
+    FT2 -->|erreurs| T2
+
+    M --> B
+```
 ### Flux de données
 
-```
-CSV Kaggle
-   │
-   ▼
-Producer Python  ──(JSON chiffré)──▶  Topic: payments  ──▶  Flink Job 1: Decrypt
-                                                                    │
-                                                                    ▼
-                                                             Flink Job 2: Validate
-                                                            /              \
-                                                     (valide)          (invalide)
-                                                        │                  │
-                                                        ▼                  ▼
-                                               Flink Job 3: Enrich   Topic: payments.dlq
-                                                        │
-                                                        ▼
-                                               Flink Job 4: Write
-                                                        │
-                                                        ▼
-                                               MinIO / rt-payments
+```mermaid
+flowchart LR
+
+    A[CSV Kaggle] --> B[Producer Python]
+
+    B -->|JSON chiffré| C[Kafka - Topic: payments]
+
+    C --> D[Flink Job: Decrypt]
+    D --> E[Flink Job: Validate]
+
+    E -->|Valide| F[Flink Job: Enrich]
+    E -->|Invalide| G[Topic: DLQ]
+
+    F --> H[Flink Job: Write]
+
+    H --> I[MinIO Bucket\nrt-payments]
 ```
 
 ---
