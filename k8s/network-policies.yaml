@@ -1,0 +1,84 @@
+# ── Default deny ingress for all namespaces ────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: kafka
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: flink
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: minio
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# ── Allow Flink → Kafka (port 9092) ───────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-flink-to-kafka
+  namespace: kafka
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: flink
+      ports:
+        - protocol: TCP
+          port: 9092
+  policyTypes:
+    - Ingress
+---
+# ── Allow intra-namespace traffic within kafka (operator ↔ broker) ─────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kafka-internal
+  namespace: kafka
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kafka
+  policyTypes:
+    - Ingress
+---
+# ── Allow Flink → MinIO (port 9000) ───────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-flink-to-minio
+  namespace: minio
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: flink
+      ports:
+        - protocol: TCP
+          port: 9000
+  policyTypes:
+    - Ingress
