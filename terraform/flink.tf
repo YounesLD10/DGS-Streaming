@@ -1,7 +1,7 @@
 # Flink Kubernetes Operator
 resource "helm_release" "flink_operator" {
   name             = "flink-kubernetes-operator"
-  repository       = "https://archive.apache.org/dist/flink/flink-kubernetes-operator-1.8.0/"
+  repository       = "https://archive.apache.org/dist/flink/flink-kubernetes-operator-${var.flink_operator_version}/"
   chart            = "flink-kubernetes-operator"
   version          = var.flink_operator_version
   namespace        = var.traitement_namespace

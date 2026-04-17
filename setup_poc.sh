@@ -310,7 +310,7 @@ EOF
 # Flink Kubernetes Operator
 resource "helm_release" "flink_operator" {
   name             = "flink-kubernetes-operator"
-  repository       = "https://downloads.apache.org/flink/flink-kubernetes-operator-${var.flink_operator_version}/"
+  repository       = "https://archive.apache.org/dist/flink/flink-kubernetes-operator-${var.flink_operator_version}/"
   chart            = "flink-kubernetes-operator"
   version          = var.flink_operator_version
   namespace        = var.traitement_namespace
