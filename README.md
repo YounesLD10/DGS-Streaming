@@ -1,7 +1,7 @@
 # DGS-Streaming — PoC Traitement Temps Réel des Paiements
 
 > **Proof of Concept** — Pipeline de traitement en temps réel des transactions de paiement,
-> déployé sur Minikube pour HPS Group (Casablanca).
+> déployé sur Minikube pour SWAM
 
 ---
 
@@ -668,4 +668,3 @@ minikube stop
 
 ---
 
-*PoC développé dans le cadre d'un stage en Data Engineering — HPS Group, Casablanca.*
