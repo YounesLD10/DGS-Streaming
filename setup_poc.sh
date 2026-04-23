@@ -1,4 +1,3 @@
-
 set -euo pipefail
 
 # Couleurs 
@@ -18,15 +17,16 @@ MINIKUBE_CPUS="${MINIKUBE_CPUS:-4}"
 MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-6144}"
 MINIKUBE_DISK="${MINIKUBE_DISK:-30g}"
 MINIKUBE_DRIVER="${MINIKUBE_DRIVER:-docker}"
-MINIKUBE_K8S_VERSION="${MINIKUBE_K8S_VERSION:-v1.29.0}"
+MINIKUBE_K8S_VERSION="${MINIKUBE_K8S_VERSION:-v1.31.4}"
 
 KAFKA_NAMESPACE="ingestion"
 FLINK_NAMESPACE="traitement"
 MINIO_NAMESPACE="stockage"
 
-STRIMZI_VERSION="0.40.0"
-FLINK_OPERATOR_VERSION="1.8.0"
-MINIO_OPERATOR_VERSION="5.0.15"
+STRIMZI_VERSION="0.43.0"
+KAFKA_VERSION="3.8.0"
+FLINK_OPERATOR_VERSION="1.10.0"
+MINIO_CHART_VERSION="5.4.0"
 
 KAFKA_CLUSTER_NAME="payments-cluster"
 KAFKA_TOPIC_PAYMENTS="payments"
@@ -61,14 +61,47 @@ check_prerequisites() {
   success "Tous les prérequis sont satisfaits"
 }
 
-# Minikube
+# Minikube — démarre le cluster en détectant et récupérant les états corrompus
 start_minikube() {
   step "Démarrage de Minikube"
-  if minikube status &>/dev/null; then
-    warn "Minikube est déjà en cours d'exécution"
-    return
+
+  # ── Cluster déjà en cours et API server sain → vérifier la version K8s ─────
+  if minikube status 2>/dev/null | grep -q "Running"; then
+    if kubectl cluster-info &>/dev/null; then
+      # Vérifier si la version K8s correspond à celle requise
+      CURRENT_K8S=$(kubectl version --short 2>/dev/null | grep "Server Version" | grep -oP 'v[\d.]+' || \
+                    kubectl version -o json 2>/dev/null | grep -o '"gitVersion":"v[^"]*"' | head -1 | grep -oP 'v[\d.]+' || echo "unknown")
+      REQUIRED_K8S="${MINIKUBE_K8S_VERSION}"
+      if [[ -n "$REQUIRED_K8S" && "$CURRENT_K8S" != "$REQUIRED_K8S" ]]; then
+        warn "Version K8s incompatible : cluster=$CURRENT_K8S, requis=$REQUIRED_K8S"
+        warn "Strimzi 0.43 / fabric8 6.13 crashe sur K8s 1.32+ (champ 'emulationMajor' inconnu)"
+        warn "Purge du cluster pour démarrer avec $REQUIRED_K8S..."
+        _minikube_purge
+      else
+        warn "Minikube est déjà en cours d'exécution et sain — rien à faire"
+        return
+      fi
+    else
+      warn "Minikube reported Running mais l\'API server ne répond pas → purge forcée"
+      _minikube_purge
+    fi
   fi
+
+  # ── Premier essai de démarrage ───────────────────────────────────────────
   log "Lancement de Minikube (CPUs=$MINIKUBE_CPUS, RAM=${MINIKUBE_MEMORY}MB, Disk=$MINIKUBE_DISK)"
+  if ! _minikube_start; then
+    warn "Démarrage échoué (cluster corrompu ou cgroup error) → purge et nouvelle tentative"
+    _minikube_purge
+    log "Nouvelle tentative de démarrage Minikube..."
+    _minikube_start || error "Impossible de démarrer Minikube après purge. Vérifiez Docker/systemd."
+  fi
+
+  success "Minikube démarré"
+  kubectl cluster-info
+}
+
+# Encapsule minikube start — retourne le code de sortie sans tuer le script (pas de set -e)
+_minikube_start() {
   minikube start \
     --driver="$MINIKUBE_DRIVER" \
     --cpus="$MINIKUBE_CPUS" \
@@ -77,8 +110,15 @@ start_minikube() {
     --kubernetes-version="$MINIKUBE_K8S_VERSION" \
     --addons=ingress,metrics-server \
     --embed-certs
-  success "Minikube démarré"
-  kubectl cluster-info
+}
+
+# Supprime entièrement le cluster Minikube corrompu
+_minikube_purge() {
+  warn "Suppression du cluster Minikube existant (minikube delete --all --purge)..."
+  minikube stop   2>/dev/null || true
+  minikube delete --all --purge 2>/dev/null || true
+  sleep 5   # laisser Docker libérer les ressources cgroup
+  success "Cluster Minikube supprimé — repartir de zéro"
 }
 
 # Génération des fichiers Terraform
@@ -128,8 +168,9 @@ variable "stockage_namespace"   { default = "$MINIO_NAMESPACE" }
 
 variable "strimzi_version"         { default = "$STRIMZI_VERSION" }
 variable "flink_operator_version"  { default = "$FLINK_OPERATOR_VERSION" }
-variable "minio_operator_version"  { default = "$MINIO_OPERATOR_VERSION" }
+variable "minio_chart_version"    { default = "$MINIO_CHART_VERSION" }
 
+variable "kafka_version"       { default = "$KAFKA_VERSION" }
 variable "kafka_cluster_name"   { default = "$KAFKA_CLUSTER_NAME" }
 variable "kafka_replicas"       { default = $KAFKA_REPLICAS }
 variable "kafka_partitions"     { default = $KAFKA_PARTITIONS }
@@ -169,9 +210,8 @@ resource "kubernetes_namespace" "stockage" {
 }
 EOF
 
-  #kafka.tf
+  # kafka.tf — helm_release natif Terraform (plus de null_resource+local-exec)
   cat > "$TERRAFORM_DIR/kafka.tf" << 'EOF'
-# Strimzi Operator (Kafka)
 resource "helm_release" "strimzi_operator" {
   name             = "strimzi-kafka-operator"
   repository       = "https://strimzi.io/charts/"
@@ -182,10 +222,6 @@ resource "helm_release" "strimzi_operator" {
   depends_on       = [kubernetes_namespace.ingestion]
 
   set {
-    name  = "watchNamespaces"
-    value = "{${var.ingestion_namespace}}"
-  }
-  set {
     name  = "resources.requests.memory"
     value = "256Mi"
   }
@@ -194,114 +230,33 @@ resource "helm_release" "strimzi_operator" {
     value = "100m"
   }
 
-  timeout         = 300
+  cleanup_on_fail = true
+  timeout         = 600
   wait            = true
-  wait_for_jobs   = true
 }
 
-# Kafka Cluster (KRaft mode — sans ZooKeeper)
-resource "kubernetes_manifest" "kafka_cluster" {
-  manifest = {
-    apiVersion = "kafka.strimzi.io/v1beta2"
-    kind       = "Kafka"
-    metadata = {
-      name      = var.kafka_cluster_name
-      namespace = var.ingestion_namespace
-    }
-    spec = {
-      kafka = {
-        version  = "3.7.0"
-        replicas = var.kafka_replicas
-        listeners = [
-          {
-            name = "plain"
-            port = 9092
-            type = "internal"
-            tls  = false
-          },
-          {
-            name = "external"
-            port = 9094
-            type = "nodeport"
-            tls  = false
-          }
-        ]
-        config = {
-          "offsets.topic.replication.factor"         = "1"
-          "transaction.state.log.replication.factor" = "1"
-          "transaction.state.log.min.isr"            = "1"
-          "default.replication.factor"               = "1"
-          "min.insync.replicas"                      = "1"
-          "inter.broker.protocol.version"            = "3.7"
-        }
-        storage = {
-          type = "ephemeral"
-        }
-        resources = {
-          requests = { memory = "512Mi", cpu = "250m" }
-          limits   = { memory = "1Gi",  cpu = "500m" }
-        }
-      }
-      zookeeper = {
-        replicas = 1
-        storage  = { type = "ephemeral" }
-        resources = {
-          requests = { memory = "256Mi", cpu = "100m" }
-          limits   = { memory = "512Mi", cpu = "200m" }
-        }
-      }
-      entityOperator = {
-        topicOperator = {}
-        userOperator  = {}
-      }
-    }
-  }
+resource "null_resource" "wait_strimzi_crds" {
   depends_on = [helm_release.strimzi_operator]
-}
 
-# Topic : payments
-resource "kubernetes_manifest" "topic_payments" {
-  manifest = {
-    apiVersion = "kafka.strimzi.io/v1beta2"
-    kind       = "KafkaTopic"
-    metadata = {
-      name      = var.topic_payments
-      namespace = var.ingestion_namespace
-      labels    = { "strimzi.io/cluster" = var.kafka_cluster_name }
-    }
-    spec = {
-      partitions = var.kafka_partitions
-      replicas   = 1
-      config = {
-        "retention.ms"       = "604800000"   # 7 jours
-        "cleanup.policy"     = "delete"
-        "compression.type"   = "lz4"
-      }
-    }
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-SCRIPT
+      set -e
+      echo "[CRD wait] Attente des CRDs Strimzi..."
+      for crd in kafkas.kafka.strimzi.io kafkatopics.kafka.strimzi.io kafkausers.kafka.strimzi.io; do
+        echo -n "  $crd ..."
+        for i in $(seq 1 60); do
+          kubectl get crd "$crd" &>/dev/null && break
+          echo -n "."
+          sleep 3
+        done
+        kubectl get crd "$crd" &>/dev/null || { echo " TIMEOUT"; exit 1; }
+        kubectl wait crd "$crd" --for=condition=Established --timeout=60s
+        echo " OK"
+      done
+      echo "[CRD wait] CRDs Strimzi prets."
+    SCRIPT
   }
-  depends_on = [kubernetes_manifest.kafka_cluster]
-}
-
-# Topic : payments.dlq
-resource "kubernetes_manifest" "topic_dlq" {
-  manifest = {
-    apiVersion = "kafka.strimzi.io/v1beta2"
-    kind       = "KafkaTopic"
-    metadata = {
-      name      = replace(var.topic_dlq, ".", "-")  # K8s name
-      namespace = var.ingestion_namespace
-      labels    = { "strimzi.io/cluster" = var.kafka_cluster_name }
-    }
-    spec = {
-      partitions = 1
-      replicas   = 1
-      config = {
-        "retention.ms"   = "2592000000"  # 30 jours
-        "cleanup.policy" = "delete"
-      }
-    }
-  }
-  depends_on = [kubernetes_manifest.kafka_cluster]
 }
 EOF
 
@@ -366,56 +321,25 @@ resource "kubernetes_secret" "minio_creds_flink" {
   depends_on = [kubernetes_namespace.traitement]
 }
 
-# FlinkDeployment : 1 JobManager + 2 TaskManagers
-resource "kubernetes_manifest" "flink_deployment" {
-  manifest = {
-    apiVersion = "flink.apache.org/v1beta1"
-    kind       = "FlinkDeployment"
-    metadata = {
-      name      = "poc-pipeline"
-      namespace = var.traitement_namespace
-    }
-    spec = {
-      image          = "flink:1.18-scala_2.12"
-      flinkVersion   = "v1_18"
-      imagePullPolicy = "IfNotPresent"
-      serviceAccount = "flink"
-
-      flinkConfiguration = {
-        "taskmanager.numberOfTaskSlots" = "4"
-        "state.backend"                 = "rocksdb"
-        "state.checkpoints.dir"         = "file:///tmp/flink-checkpoints"
-        "execution.checkpointing.interval"             = "60s"
-        "execution.checkpointing.mode"                 = "EXACTLY_ONCE"
-        "execution.checkpointing.min-pause"            = "30s"
-        "restart-strategy"                             = "exponential-delay"
-        "restart-strategy.exponential-delay.initial-backoff" = "1s"
-        "restart-strategy.exponential-delay.max-backoff"     = "5min"
-      }
-
-      jobManager = {
-        resource = {
-          memory = "1024m"
-          cpu    = 0.5
-        }
-        replicas = 1
-      }
-
-      taskManager = {
-        resource = {
-          memory = "1024m"
-          cpu    = 1.0
-        }
-        replicas = 2
-      }
-
-      # Pas de job embarqué au démarrage (session cluster)
-      # Les 4 jobs seront soumis séparément via Flink REST API
-      mode = "standalone"
-    }
-  }
+# Attente CRDs Flink — barrière de synchronisation avant stage2
+resource "null_resource" "wait_flink_crds" {
   depends_on = [helm_release.flink_operator]
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-SCRIPT
+      echo "[CRD wait] Attente des CRDs Flink..."
+      for crd in flinkdeployments.flink.apache.org flinksessionjobs.flink.apache.org; do
+        echo -n "  $crd ..."
+        until kubectl get crd "$crd" &>/dev/null; do echo -n "."; sleep 3; done
+        kubectl wait crd "$crd" --for=condition=Established --timeout=120s
+        echo " OK"
+      done
+      echo "[CRD wait] CRDs Flink prêts."
+    SCRIPT
+  }
 }
+
 EOF
 
   # minio.tf
@@ -425,6 +349,7 @@ resource "helm_release" "minio" {
   name             = "minio"
   repository       = "https://charts.min.io/"
   chart            = "minio"
+  version          = var.minio_chart_version
   namespace        = var.stockage_namespace
   create_namespace = false
   depends_on       = [kubernetes_namespace.stockage]
@@ -470,6 +395,7 @@ resource "helm_release" "minio" {
     value = "ClusterIP"
   }
 
+  cleanup_on_fail = true
   timeout = 300
   wait    = true
 }
@@ -513,6 +439,158 @@ output "minio_bucket" {
 EOF
 
   success "Fichiers Terraform générés dans $TERRAFORM_DIR"
+}
+
+# Génération des fichiers Terraform stage2 (ressources nécessitant les CRDs)
+# Ce répertoire est appliqué APRÈS que les CRDs soient enregistrées.
+# Isoler ces ressources ici empêche terraform plan/validate de les voir prématurément.
+generate_stage2_files() {
+  step "Génération des fichiers Terraform stage2 (ressources CRD)"
+  local S2="$TERRAFORM_DIR/stage2"
+  mkdir -p "$S2"
+
+  # main.tf stage2 — réutilise le même cluster minikube
+  cat > "$S2/main.tf" << 'EOF'
+terraform {
+  required_version = ">= 1.7"
+  required_providers {
+    kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.27" }
+  }
+}
+provider "kubernetes" {
+  config_path    = "~/.kube/config"
+  config_context = "minikube"
+}
+EOF
+
+  # variables.tf stage2
+  cat > "$S2/variables.tf" << EOF
+variable "ingestion_namespace"  { default = "$KAFKA_NAMESPACE" }
+variable "traitement_namespace" { default = "$FLINK_NAMESPACE" }
+variable "kafka_version"       { default = "$KAFKA_VERSION" }
+variable "kafka_cluster_name"   { default = "$KAFKA_CLUSTER_NAME" }
+variable "kafka_replicas"       { default = $KAFKA_REPLICAS }
+variable "kafka_partitions"     { default = $KAFKA_PARTITIONS }
+variable "topic_payments"       { default = "$KAFKA_TOPIC_PAYMENTS" }
+variable "topic_dlq"            { default = "$KAFKA_TOPIC_DLQ" }
+variable "minio_access_key"     { default = "$MINIO_ACCESS_KEY" }
+variable "minio_secret_key"     { default = "$MINIO_SECRET_KEY" }
+EOF
+
+  # kafka-crd.tf — Kafka cluster + topics
+  cat > "$S2/kafka-crd.tf" << 'EOF'
+resource "kubernetes_manifest" "kafka_cluster" {
+  manifest = {
+    apiVersion = "kafka.strimzi.io/v1beta2"
+    kind       = "Kafka"
+    metadata = {
+      name      = var.kafka_cluster_name
+      namespace = var.ingestion_namespace
+    }
+    spec = {
+      kafka = {
+        version  = var.kafka_version
+        replicas = var.kafka_replicas
+        listeners = [
+          { name = "plain",    port = 9092, type = "internal", tls = false },
+          { name = "external", port = 9094, type = "nodeport", tls = false }
+        ]
+        config = {
+          "offsets.topic.replication.factor"         = "1"
+          "transaction.state.log.replication.factor" = "1"
+          "transaction.state.log.min.isr"            = "1"
+          "default.replication.factor"               = "1"
+          "min.insync.replicas"                      = "1"
+
+        }
+        storage   = { type = "ephemeral" }
+        resources = {
+          requests = { memory = "512Mi", cpu = "250m" }
+          limits   = { memory = "1Gi",  cpu = "500m" }
+        }
+      }
+      zookeeper = {
+        replicas  = 1
+        storage   = { type = "ephemeral" }
+        resources = {
+          requests = { memory = "256Mi", cpu = "100m" }
+          limits   = { memory = "512Mi", cpu = "200m" }
+        }
+      }
+      entityOperator = { topicOperator = {}, userOperator = {} }
+    }
+  }
+}
+
+resource "kubernetes_manifest" "topic_payments" {
+  manifest = {
+    apiVersion = "kafka.strimzi.io/v1beta2"
+    kind       = "KafkaTopic"
+    metadata = {
+      name      = var.topic_payments
+      namespace = var.ingestion_namespace
+      labels    = { "strimzi.io/cluster" = var.kafka_cluster_name }
+    }
+    spec = {
+      partitions = var.kafka_partitions
+      replicas   = 1
+      config     = { "retention.ms" = "604800000", "cleanup.policy" = "delete", "compression.type" = "lz4" }
+    }
+  }
+  depends_on = [kubernetes_manifest.kafka_cluster]
+}
+
+resource "kubernetes_manifest" "topic_dlq" {
+  manifest = {
+    apiVersion = "kafka.strimzi.io/v1beta2"
+    kind       = "KafkaTopic"
+    metadata = {
+      name      = replace(var.topic_dlq, ".", "-")
+      namespace = var.ingestion_namespace
+      labels    = { "strimzi.io/cluster" = var.kafka_cluster_name }
+    }
+    spec = {
+      partitions = 1
+      replicas   = 1
+      config     = { "retention.ms" = "2592000000", "cleanup.policy" = "delete" }
+    }
+  }
+  depends_on = [kubernetes_manifest.kafka_cluster]
+}
+EOF
+
+  # flink-crd.tf — FlinkDeployment
+  cat > "$S2/flink-crd.tf" << 'EOF'
+resource "kubernetes_manifest" "flink_deployment" {
+  manifest = {
+    apiVersion = "flink.apache.org/v1beta1"
+    kind       = "FlinkDeployment"
+    metadata   = { name = "poc-pipeline", namespace = var.traitement_namespace }
+    spec = {
+      image           = "flink:1.18-scala_2.12"
+      flinkVersion    = "v1_18"
+      imagePullPolicy = "IfNotPresent"
+      serviceAccount  = "flink"
+      flinkConfiguration = {
+        "taskmanager.numberOfTaskSlots"                      = "4"
+        "state.backend"                                      = "rocksdb"
+        "state.checkpoints.dir"                              = "file:///tmp/flink-checkpoints"
+        "execution.checkpointing.interval"                   = "60s"
+        "execution.checkpointing.mode"                       = "EXACTLY_ONCE"
+        "execution.checkpointing.min-pause"                  = "30s"
+        "restart-strategy"                                   = "exponential-delay"
+        "restart-strategy.exponential-delay.initial-backoff" = "1s"
+        "restart-strategy.exponential-delay.max-backoff"     = "5min"
+      }
+      jobManager  = { resource = { memory = "1024m", cpu = 0.5 }, replicas = 1 }
+      taskManager = { resource = { memory = "1024m", cpu = 1.0 }, replicas = 2 }
+      mode        = "standalone"
+    }
+  }
+}
+EOF
+
+  success "Fichiers Terraform stage2 générés dans $S2"
 }
 
 #  Génération des manifests K8s complémentaires
@@ -668,25 +746,139 @@ PYEOF
   success "Script producer.py généré dans $SCRIPTS_DIR"
 }
 
+# Nettoyage des résidus Helm/RBAC avant apply (évite les conflits lors d'un re-déploiement)
+cleanup_before_deploy() {
+  step "Nettoyage pré-déploiement (résidus Helm, RBAC, CRDs)"
+
+  # ── Strimzi ──────────────────────────────────────────────────────────────
+  # Désinstalle si présent, qu'il soit en état "deployed" ou "failed"
+  local strimzi_status
+  strimzi_status=$(helm status strimzi-kafka-operator -n "$KAFKA_NAMESPACE" \
+                     --output json 2>/dev/null | grep -o '"status":"[^"]*"' | head -1 || true)
+  if [[ -n "$strimzi_status" ]]; then
+    warn "Release Helm 'strimzi-kafka-operator' trouvée (${strimzi_status}) → désinstallation forcée"
+    helm uninstall strimzi-kafka-operator -n "$KAFKA_NAMESPACE" \
+      --wait --timeout 120s --ignore-not-found 2>/dev/null || \
+    helm uninstall strimzi-kafka-operator -n "$KAFKA_NAMESPACE" \
+      --no-hooks --ignore-not-found 2>/dev/null || true
+  fi
+
+  # RoleBindings orphelins Strimzi — double approche :
+  # 1. Suppression directe dans tous les namespaces connus
+  # 2. Scan --all-namespaces pour attraper les namespaces inattendus
+  log "Suppression des ClusterRole/ClusterRoleBinding Strimzi..."
+  kubectl get clusterrole 2>/dev/null     | grep strimzi | awk '{print $1}'     | xargs -r kubectl delete clusterrole --ignore-not-found 2>/dev/null || true
+  kubectl get clusterrolebinding 2>/dev/null     | grep strimzi | awk '{print $1}'     | xargs -r kubectl delete clusterrolebinding --ignore-not-found 2>/dev/null || true
+
+  log "Suppression des RoleBindings Strimzi dans tous les namespaces..."
+  local all_ns
+  all_ns=$(kubectl get namespaces --no-headers -o custom-columns="NS:.metadata.name" 2>/dev/null || echo "")
+  for rb in strimzi-cluster-operator strimzi-cluster-operator-watched             strimzi-cluster-operator-entity-operator-delegation             strimzi-cluster-operator-leader-election; do
+    for ns in $all_ns; do
+      [ -z "$ns" ] && continue
+      kubectl delete rolebinding "$rb" -n "$ns" --ignore-not-found 2>/dev/null || true
+    done
+  done
+
+    # ── Flink operator ───────────────────────────────────────────────────────
+  if helm status flink-kubernetes-operator -n "$FLINK_NAMESPACE" &>/dev/null; then
+    warn "Release Helm 'flink-kubernetes-operator' déjà présente → désinstallation"
+    helm uninstall flink-kubernetes-operator -n "$FLINK_NAMESPACE" --wait --timeout 120s || true
+  fi
+
+  # ── MinIO ────────────────────────────────────────────────────────────────
+  if helm status minio -n "$MINIO_NAMESPACE" &>/dev/null; then
+    warn "Release Helm 'minio' déjà présente → désinstallation"
+    helm uninstall minio -n "$MINIO_NAMESPACE" --wait --timeout 120s || true
+  fi
+
+
+  # Le tfstate N'est JAMAIS supprimé ici — uniquement par teardown().
+  # _tf_import_if_missing() gère la réconciliation state/cluster avant apply.
+
+  # ── ConfigMap et Secrets orphelins ───────────────────────────────────────
+  # Ces ressources légères sont supprimées si elles existent sans être dans
+  # le tfstate — Terraform les recréera en quelques secondes.
+  # (Évite "already exists" sans avoir à faire terraform import)
+  log "Nettoyage ConfigMap et Secrets orphelins..."
+  kubectl delete configmap flink-pipeline-config -n "$FLINK_NAMESPACE" --ignore-not-found 2>/dev/null || true
+  kubectl delete secret minio-credentials -n "$FLINK_NAMESPACE" --ignore-not-found 2>/dev/null || true
+  kubectl delete secret minio-credentials -n "$MINIO_NAMESPACE" --ignore-not-found 2>/dev/null || true
+
+  # Supprimer tfstate si namespaces absents (désync après crash/arrêt brutal)
+  if ! kubectl get namespace "$KAFKA_NAMESPACE" &>/dev/null && \
+     [[ -f "$TERRAFORM_DIR/terraform.tfstate" ]]; then
+    warn "Namespaces absents mais tfstate présent → suppression tfstate"
+    rm -f "$TERRAFORM_DIR/terraform.tfstate" "$TERRAFORM_DIR/terraform.tfstate.bak"
+    rm -f "$TERRAFORM_DIR/stage2/terraform.tfstate" "$TERRAFORM_DIR/stage2/terraform.tfstate.bak"
+  fi
+
+  success "Nettoyage terminé — environnement prêt pour un déploiement propre"
+}
+
 # Application Terraform
-apply_terraform() {
-  step "Application de l'infrastructure Terraform"
-  cd "$TERRAFORM_DIR"
+# Importe dans le tfstate les ressources qui existent dans le cluster
+# mais sont absentes du state — évite "already exists" après un state perdu.
+_tf_import_if_missing() {
+  local tfdir="$1"
+  cd "$tfdir"
 
-  log "terraform init"
-  terraform init -upgrade
+  # Helper: import if resource missing from state
+  _import_if() {
+    local res="$1" id="$2"
+    if ! terraform state list 2>/dev/null | grep -qF "$res"; then
+      warn "Import $res ($id)"
+      terraform import -input=false "$res" "$id" 2>/dev/null || true
+    fi
+  }
 
-  log "terraform validate"
-  terraform validate
+  # Namespaces
+  kubectl get namespace "$KAFKA_NAMESPACE" &>/dev/null && _import_if "kubernetes_namespace.ingestion"  "$KAFKA_NAMESPACE"
+  kubectl get namespace "$FLINK_NAMESPACE" &>/dev/null && _import_if "kubernetes_namespace.traitement" "$FLINK_NAMESPACE"
+  kubectl get namespace "$MINIO_NAMESPACE" &>/dev/null && _import_if "kubernetes_namespace.stockage"   "$MINIO_NAMESPACE"
 
-  log "terraform plan"
-  terraform plan -out=tfplan
+  # Helm releases
+  helm status strimzi-kafka-operator    -n "$KAFKA_NAMESPACE" &>/dev/null && _import_if "helm_release.strimzi_operator" "$KAFKA_NAMESPACE/strimzi-kafka-operator"
+  helm status flink-kubernetes-operator -n "$FLINK_NAMESPACE" &>/dev/null && _import_if "helm_release.flink_operator"   "$FLINK_NAMESPACE/flink-kubernetes-operator"
+  helm status minio                     -n "$MINIO_NAMESPACE" &>/dev/null && _import_if "helm_release.minio"             "$MINIO_NAMESPACE/minio"
 
-  log "terraform apply"
-  terraform apply -auto-approve tfplan
+  # ConfigMap flink-pipeline-config
+  kubectl get configmap flink-pipeline-config -n "$FLINK_NAMESPACE" &>/dev/null &&     _import_if "kubernetes_config_map.flink_config" "$FLINK_NAMESPACE/flink-pipeline-config"
+
+  # Secrets minio-credentials
+  kubectl get secret minio-credentials -n "$MINIO_NAMESPACE" &>/dev/null &&     _import_if "kubernetes_secret.minio_creds"       "$MINIO_NAMESPACE/minio-credentials"
+  kubectl get secret minio-credentials -n "$FLINK_NAMESPACE" &>/dev/null &&     _import_if "kubernetes_secret.minio_creds_flink" "$FLINK_NAMESPACE/minio-credentials"
 
   cd - > /dev/null
-  success "Infrastructure Terraform appliquée"
+}
+
+apply_terraform() {
+  step "Application de l'infrastructure Terraform"
+
+  # ── Étape 1 : tout sauf les ressources CRD-dépendantes ───────────────────
+  # Le répertoire terraform/ ne contient PAS les manifests Kafka/Flink CRD :
+  # ils sont dans terraform/stage2/ et n'existent pas encore sur disque.
+  # => terraform plan/validate ne peut pas échouer sur des CRDs manquantes.
+  cd "$TERRAFORM_DIR"
+  log "terraform init (étape 1)"
+  terraform init -upgrade
+  _tf_import_if_missing "$TERRAFORM_DIR"
+  log "terraform apply — étape 1 : namespaces, operators, attente CRDs"
+  terraform apply -auto-approve
+  cd - > /dev/null
+
+  # ── Étape 2 : ressources CRD-dépendantes ─────────────────────────────────
+  # generate_stage2_files() a déjà écrit terraform/stage2/ sur disque.
+  # Les CRDs sont maintenant Established → le provider peut les valider.
+  local S2="$TERRAFORM_DIR/stage2"
+  cd "$S2"
+  log "terraform init (étape 2 — stage2)"
+  terraform init -upgrade
+  log "terraform apply — étape 2 : Kafka cluster, topics, FlinkDeployment"
+  terraform apply -auto-approve
+  cd - > /dev/null
+
+  success "Infrastructure Terraform appliquée (étapes 1 + 2)"
 }
 
 #  Application RBAC & network policies
@@ -782,11 +974,96 @@ teardown() {
   read -r -p "Confirmer la destruction ? (yes/no) : " confirm
   [[ "$confirm" == "yes" ]] || { log "Annulé."; exit 0; }
 
-  cd "$TERRAFORM_DIR"
-  terraform destroy -auto-approve
-  cd - > /dev/null
-  minikube stop
-  success "Infrastructure détruite et Minikube arrêté"
+  # 1. Désinstaller les Helm releases explicitement (Terraform peut échouer
+  #    si des CRDs/RoleBindings sont déjà dans un état incohérent)
+  log "Désinstallation des releases Helm..."
+  helm uninstall strimzi-kafka-operator  -n "$KAFKA_NAMESPACE"  --ignore-not-found --wait --timeout 120s 2>/dev/null || true
+  helm uninstall flink-kubernetes-operator -n "$FLINK_NAMESPACE" --ignore-not-found --wait --timeout 120s 2>/dev/null || true
+  helm uninstall minio                   -n "$MINIO_NAMESPACE"  --ignore-not-found --wait --timeout 120s 2>/dev/null || true
+
+  # 2. Supprimer les RoleBindings orphelins de Strimzi dans TOUS les namespaces
+  log "Suppression des RoleBindings Strimzi dans tous les namespaces POC..."
+  for ns in ingestion traitement stockage default; do
+    for rb in strimzi-cluster-operator strimzi-cluster-operator-watched \
+              strimzi-cluster-operator-entity-operator-delegation \
+              strimzi-cluster-operator-leader-election; do
+      kubectl delete rolebinding "$rb" -n "$ns" --ignore-not-found 2>/dev/null || true
+    done
+    kubectl get secrets -n "$ns" -o name 2>/dev/null \
+      | grep strimzi | xargs -r kubectl delete -n "$ns" --ignore-not-found 2>/dev/null || true
+  done
+
+  # 3. Patch finalizers Kafka avant terraform destroy
+  log "Patch finalizers Kafka/KafkaTopic..."
+  kubectl get kafka -n ingestion --no-headers -o custom-columns="NAME:.metadata.name" 2>/dev/null     | xargs -r -I{} kubectl patch kafka {} -n ingestion         --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+  kubectl get kafkatopic -n ingestion --no-headers -o custom-columns="NAME:.metadata.name" 2>/dev/null     | xargs -r -I{} kubectl patch kafkatopic {} -n ingestion         --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+
+  # 4. Terraform destroy (namespaces + secrets + configmaps restants)
+  # Détruire stage2 d'abord (CRD resources), puis stage1 (operators/namespaces)
+  # Force-clear finalizers en arriere-plan pendant terraform destroy
+  _force_clear_bg() {
+    while true; do
+      for ns in ingestion traitement stockage; do
+        kubectl get namespace "$ns" -o json 2>/dev/null           | jq '.spec.finalizers = []'           | kubectl replace --raw "/api/v1/namespaces/$ns/finalize" -f - 2>/dev/null || true
+      done
+      sleep 5
+    done
+  }
+  _force_clear_bg &
+  local _bg_pid=$!
+
+  local S2="$TERRAFORM_DIR/stage2"
+  if [[ -f "$S2/terraform.tfstate" ]]; then
+    cd "$S2"
+    terraform destroy -auto-approve 2>/dev/null || true
+    cd - > /dev/null
+  fi
+  if [[ -f "$TERRAFORM_DIR/terraform.tfstate" ]]; then
+    cd "$TERRAFORM_DIR"
+    terraform destroy -auto-approve 2>/dev/null || true
+    cd - > /dev/null
+  fi
+  kill $_bg_pid 2>/dev/null || true
+
+  # 5. Supprimer les namespaces et ATTENDRE leur disparition complète
+  #    (évite la race condition "namespace already exists / Terminating" au prochain 'up')
+  for ns in "$KAFKA_NAMESPACE" "$FLINK_NAMESPACE" "$MINIO_NAMESPACE"; do
+    kubectl delete namespace "$ns" --ignore-not-found 2>/dev/null || true
+  done
+
+  log "Attente de la terminaison complète des namespaces..."
+  for ns in "$KAFKA_NAMESPACE" "$FLINK_NAMESPACE" "$MINIO_NAMESPACE"; do
+    elapsed=0
+    while kubectl get namespace "$ns" &>/dev/null; do
+      if (( elapsed >= 90 )); then
+        warn "Namespace '$ns' bloqué en Terminating depuis ${elapsed}s → suppression forcée des finalizers"
+        kubectl get namespace "$ns" -o json \
+          | jq '.spec.finalizers = []' \
+          | kubectl replace --raw "/api/v1/namespaces/$ns/finalize" -f - 2>/dev/null || true
+        sleep 5
+        break
+      fi
+      log "  '$ns' encore en Terminating... (${elapsed}s)"
+      sleep 5
+      (( elapsed += 5 ))
+    done
+    success "Namespace '$ns' supprimé"
+  done
+
+  # 6. Nettoyer le tfstate pour que le prochain 'up' reparte de zéro
+  rm -f "$TERRAFORM_DIR/terraform.tfstate" \
+        "$TERRAFORM_DIR/terraform.tfstate.bak" \
+        "$TERRAFORM_DIR/terraform.tfstate.lock.info" \
+        "$TERRAFORM_DIR/tfplan"
+  rm -f "$TERRAFORM_DIR/stage2/terraform.tfstate" \
+        "$TERRAFORM_DIR/stage2/terraform.tfstate.bak" \
+        "$TERRAFORM_DIR/stage2/terraform.tfstate.lock.info"
+
+  # 7. Arrêter Minikube proprement (stop suffit — on garde le cluster pour éviter
+  #    les cgroup issues au prochain démarrage ; delete --purge seulement si demandé)
+  log "Arrêt de Minikube..."
+  minikube stop 2>/dev/null || true
+  success "Infrastructure détruite et Minikube arrêté — prêt pour un nouveau 'up'"
 }
 
 #  Point d'entrée 
@@ -808,8 +1085,10 @@ main() {
       check_prerequisites
       start_minikube
       generate_terraform_files
+      generate_stage2_files
       generate_k8s_manifests
       generate_producer_script
+      cleanup_before_deploy
       apply_terraform
       apply_k8s_extras
       wait_for_components
@@ -822,7 +1101,16 @@ main() {
       generate_terraform_files
       cd "$TERRAFORM_DIR"
       terraform init -upgrade -reconfigure
-      terraform plan
+      # Plan partiel : les manifests CRD (Kafka, FlinkDeployment) ne peuvent pas
+      # être planifiés tant que les CRDs ne sont pas installées dans le cluster.
+      warn "Plan partiel (namespaces + operators) — les manifests CRD nécessitent un 'up' complet"
+      terraform plan \
+        -target=kubernetes_namespace.ingestion \
+        -target=kubernetes_namespace.traitement \
+        -target=kubernetes_namespace.stockage \
+        -target=helm_release.strimzi_operator \
+        -target=helm_release.flink_operator \
+        -target=helm_release.minio
       ;;
     status)
       echo -e "\n${CYAN}=== ingestion  (Kafka / Strimzi) — namespace: $KAFKA_NAMESPACE ===${NC}"
