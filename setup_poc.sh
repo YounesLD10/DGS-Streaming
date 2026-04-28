@@ -14,7 +14,7 @@ step()    { echo -e "\n${CYAN}════════════════�
 
 # Configuration
 MINIKUBE_CPUS="${MINIKUBE_CPUS:-4}"
-MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-6144}"
+MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-7168}"
 MINIKUBE_DISK="${MINIKUBE_DISK:-30g}"
 MINIKUBE_DRIVER="${MINIKUBE_DRIVER:-docker}"
 MINIKUBE_K8S_VERSION="${MINIKUBE_K8S_VERSION:-v1.31.4}"
@@ -32,7 +32,7 @@ KAFKA_CLUSTER_NAME="payments-cluster"
 KAFKA_TOPIC_PAYMENTS="payments"
 KAFKA_TOPIC_DLQ="payments.dlq"
 KAFKA_REPLICAS=1          # POC : 1 broker suffit
-KAFKA_PARTITIONS=3
+KAFKA_PARTITIONS=1
 
 MINIO_BUCKET="rt-payments"
 MINIO_ACCESS_KEY="minioadmin"
@@ -41,9 +41,15 @@ MINIO_SECRET_KEY="minioadmin"
 FLINK_JOBMANAGER_REPLICAS=1
 FLINK_TASKMANAGER_REPLICAS=2
 
+# Image baked locally inside the minikube docker daemon (imagePullPolicy=Never)
+JOBS_IMAGE="${JOBS_IMAGE:-rt-payments-flink-jobs:1.0}"
+
 TERRAFORM_DIR="$(pwd)/terraform"
 K8S_MANIFESTS_DIR="$(pwd)/k8s"
 SCRIPTS_DIR="$(pwd)/scripts"
+JOBS_DIR="$(pwd)/flink-jobs"
+PRODUCER_DIR="$(pwd)/producer"
+FERNET_KEY_FILE="$(pwd)/.fernet.key"
 
 # Vérification des prérequis 
 check_prerequisites() {
@@ -467,14 +473,19 @@ EOF
   cat > "$S2/variables.tf" << EOF
 variable "ingestion_namespace"  { default = "$KAFKA_NAMESPACE" }
 variable "traitement_namespace" { default = "$FLINK_NAMESPACE" }
-variable "kafka_version"       { default = "$KAFKA_VERSION" }
+variable "stockage_namespace"   { default = "$MINIO_NAMESPACE" }
+variable "kafka_version"        { default = "$KAFKA_VERSION" }
 variable "kafka_cluster_name"   { default = "$KAFKA_CLUSTER_NAME" }
 variable "kafka_replicas"       { default = $KAFKA_REPLICAS }
 variable "kafka_partitions"     { default = $KAFKA_PARTITIONS }
-variable "topic_payments"       { default = "$KAFKA_TOPIC_PAYMENTS" }
-variable "topic_dlq"            { default = "$KAFKA_TOPIC_DLQ" }
+variable "minio_bucket"         { default = "$MINIO_BUCKET" }
 variable "minio_access_key"     { default = "$MINIO_ACCESS_KEY" }
 variable "minio_secret_key"     { default = "$MINIO_SECRET_KEY" }
+variable "jobs_image"           { default = "$JOBS_IMAGE" }
+variable "fernet_key" {
+  description = "Fernet key shared by producer (encrypt) and Job 1 (decrypt)"
+  sensitive   = true
+}
 EOF
 
   # kafka-crd.tf — Kafka cluster + topics
@@ -522,71 +533,150 @@ resource "kubernetes_manifest" "kafka_cluster" {
   }
 }
 
-resource "kubernetes_manifest" "topic_payments" {
-  manifest = {
-    apiVersion = "kafka.strimzi.io/v1beta2"
-    kind       = "KafkaTopic"
-    metadata = {
-      name      = var.topic_payments
-      namespace = var.ingestion_namespace
-      labels    = { "strimzi.io/cluster" = var.kafka_cluster_name }
-    }
-    spec = {
-      partitions = var.kafka_partitions
-      replicas   = 1
-      config     = { "retention.ms" = "604800000", "cleanup.policy" = "delete", "compression.type" = "lz4" }
-    }
+# Pipeline topics: ingestion → 4 stages → DLQ
+locals {
+  pipeline_topics = {
+    "payments"            = { partitions = var.kafka_partitions, retention_ms = 604800000 }
+    "payments.decrypted"  = { partitions = var.kafka_partitions, retention_ms = 604800000 }
+    "payments.validated"  = { partitions = var.kafka_partitions, retention_ms = 604800000 }
+    "payments.normalized" = { partitions = var.kafka_partitions, retention_ms = 604800000 }
+    "payments.dlq"        = { partitions = 1,                    retention_ms = 2592000000 }
   }
-  depends_on = [kubernetes_manifest.kafka_cluster]
 }
 
-resource "kubernetes_manifest" "topic_dlq" {
+resource "kubernetes_manifest" "pipeline_topics" {
+  for_each = local.pipeline_topics
   manifest = {
     apiVersion = "kafka.strimzi.io/v1beta2"
     kind       = "KafkaTopic"
     metadata = {
-      name      = replace(var.topic_dlq, ".", "-")
+      # Resource name must match RFC1123 (no dots) — Strimzi reads spec.topicName for the actual Kafka name.
+      name      = replace(each.key, ".", "-")
       namespace = var.ingestion_namespace
       labels    = { "strimzi.io/cluster" = var.kafka_cluster_name }
     }
     spec = {
-      partitions = 1
+      topicName  = each.key
+      partitions = each.value.partitions
       replicas   = 1
-      config     = { "retention.ms" = "2592000000", "cleanup.policy" = "delete" }
+      config = {
+        "retention.ms"     = tostring(each.value.retention_ms)
+        "cleanup.policy"   = "delete"
+        "compression.type" = "lz4"
+      }
     }
   }
   depends_on = [kubernetes_manifest.kafka_cluster]
 }
 EOF
 
-  # flink-crd.tf — FlinkDeployment
+  # flink-crd.tf — Fernet secrets + 4 application-mode FlinkDeployments
+  # local:// jarURI only works in application mode (JM reads its own fs).
+  # FlinkSessionJob requires the operator to upload the jar, which fails for local://.
+  # Memory tuning: reduce jvm-metaspace (256m→128m) and jvm-overhead.min (192m→64m)
+  # so 768m JM and 640m TM both pass Flink's memory validation.
   cat > "$S2/flink-crd.tf" << 'EOF'
-resource "kubernetes_manifest" "flink_deployment" {
+# Same Fernet key in both namespaces (producer reads from ingestion, Job 1 from traitement)
+resource "kubernetes_secret" "fernet_traitement" {
+  metadata {
+    name      = "fernet-key"
+    namespace = var.traitement_namespace
+  }
+  type = "Opaque"
+  data = { key = var.fernet_key }
+}
+
+resource "kubernetes_secret" "fernet_ingestion" {
+  metadata {
+    name      = "fernet-key"
+    namespace = var.ingestion_namespace
+  }
+  type = "Opaque"
+  data = { key = var.fernet_key }
+}
+
+locals {
+  bootstrap = "${var.kafka_cluster_name}-kafka-bootstrap.${var.ingestion_namespace}.svc:9092"
+  jobs = {
+    "job1-decryption"    = { script = "job1_decryption.py" }
+    "job2-validation"    = { script = "job2_validation.py" }
+    "job3-normalization" = { script = "job3_normalization.py" }
+    "job4-sink"          = { script = "job4_sink.py" }
+  }
+  flink_conf = {
+    "taskmanager.numberOfTaskSlots"                      = "1"
+    "state.backend"                                      = "hashmap"
+    "state.checkpoints.dir"                              = "file:///tmp/flink-checkpoints"
+    "execution.checkpointing.interval"                   = "120s"
+    "execution.checkpointing.mode"                       = "AT_LEAST_ONCE"
+    "execution.checkpointing.min-pause"                  = "60s"
+    "restart-strategy"                                   = "exponential-delay"
+    "restart-strategy.exponential-delay.initial-backoff" = "5s"
+    "restart-strategy.exponential-delay.max-backoff"     = "5min"
+    # Reduce JVM overhead so 768m JM and 640m TM pass Flink memory validation.
+    # Default metaspace=256m costs too much; 128m is sufficient for PyFlink.
+    # Default overhead.min=192m leaves only 64m Flink memory in a 512m container.
+    "jobmanager.memory.jvm-metaspace.size"               = "128mb"
+    "jobmanager.memory.jvm-overhead.min"                 = "64mb"
+    "taskmanager.memory.jvm-metaspace.size"              = "128mb"
+    "taskmanager.memory.jvm-overhead.min"                = "64mb"
+    # Reduce managed-memory fraction (Python gets 20% instead of 40%).
+    # A simple POC streaming job needs far less than the default 40%.
+    "taskmanager.memory.managed.fraction"                = "0.2"
+    "s3.endpoint"                                        = "http://minio.${var.stockage_namespace}.svc:9000"
+    "s3.path.style.access"                               = "true"
+    "s3.access-key"                                      = var.minio_access_key
+    "s3.secret-key"                                      = var.minio_secret_key
+  }
+}
+
+resource "kubernetes_manifest" "flink_jobs" {
+  for_each = local.jobs
   manifest = {
     apiVersion = "flink.apache.org/v1beta1"
     kind       = "FlinkDeployment"
-    metadata   = { name = "poc-pipeline", namespace = var.traitement_namespace }
-    spec = {
-      image           = "flink:1.18-scala_2.12"
-      flinkVersion    = "v1_18"
-      imagePullPolicy = "IfNotPresent"
-      serviceAccount  = "flink"
-      flinkConfiguration = {
-        "taskmanager.numberOfTaskSlots"                      = "4"
-        "state.backend"                                      = "rocksdb"
-        "state.checkpoints.dir"                              = "file:///tmp/flink-checkpoints"
-        "execution.checkpointing.interval"                   = "60s"
-        "execution.checkpointing.mode"                       = "EXACTLY_ONCE"
-        "execution.checkpointing.min-pause"                  = "30s"
-        "restart-strategy"                                   = "exponential-delay"
-        "restart-strategy.exponential-delay.initial-backoff" = "1s"
-        "restart-strategy.exponential-delay.max-backoff"     = "5min"
+    metadata = {
+      name      = each.key
+      namespace = var.traitement_namespace
+      labels    = {
+        "app.kubernetes.io/part-of"   = "rt-payments"
+        "app.kubernetes.io/component" = each.key
       }
-      jobManager  = { resource = { memory = "1024m", cpu = 0.5 }, replicas = 1 }
-      taskManager = { resource = { memory = "1024m", cpu = 1.0 }, replicas = 2 }
-      mode        = "standalone"
+    }
+    spec = {
+      image           = var.jobs_image
+      imagePullPolicy = "Never"
+      flinkVersion    = "v1_18"
+      serviceAccount  = "flink"
+      flinkConfiguration = local.flink_conf
+      # JM 768m: metaspace(128)+overhead(77)=205 → Flink memory=563m ✓
+      # TM 640m: metaspace(128)+overhead(64)=192 → Flink memory=448m ✓
+      jobManager  = { resource = { memory = "768m", cpu = 0.25 }, replicas = 1 }
+      taskManager = { resource = { memory = "640m", cpu = 0.5  }, replicas = 1 }
+      podTemplate = {
+        spec = {
+          containers = [{
+            name = "flink-main-container"
+            env = [
+              { name = "KAFKA_BOOTSTRAP", value = local.bootstrap },
+              { name  = "FERNET_KEY"
+                valueFrom = { secretKeyRef = { name = "fernet-key", key = "key" } }
+              },
+              { name = "S3_BUCKET", value = var.minio_bucket },
+            ]
+          }]
+        }
+      }
+      job = {
+        jarURI      = "local:///opt/flink/python-driver/flink-python.jar"
+        entryClass  = "org.apache.flink.client.python.PythonDriver"
+        args        = ["-pyclientexec", "/usr/bin/python3", "-py", "/opt/jobs/${each.value.script}"]
+        parallelism = 1
+        upgradeMode = "stateless"
+      }
     }
   }
+  depends_on = [kubernetes_secret.fernet_traitement]
 }
 EOF
 
@@ -662,89 +752,8 @@ EOF
   success "Manifests K8s générés dans $K8S_MANIFESTS_DIR"
 }
 
-# Génération du script producteur Python
-generate_producer_script() {
-  step "Génération du script Producer Python"
-  mkdir -p "$SCRIPTS_DIR"
-
-  cat > "$SCRIPTS_DIR/producer.py" << 'PYEOF'
-#!/usr/bin/env python3
-"""
-Producer POC — lit le CSV Kaggle et publie sur le topic Kafka 'payments'
-Chaque message est chiffré en base64 (simulation AES) et encodé en JSON.
-
-Usage :
-  pip install kafka-python pandas cryptography
-  python producer.py --csv <fichier.csv> [--bootstrap <host:port>] [--rate <msg/s>]
-"""
-import argparse, base64, json, sys, time
-from datetime import datetime, timezone
-
-import pandas as pd
-from kafka import KafkaProducer
-from cryptography.fernet import Fernet
-
-# Clé de chiffrement fixe pour le POC (à remplacer par KMS en prod)
-_FERNET_KEY = b"dGhpcyBpcyBhIDMyLWJ5dGUga2V5AAAAAAAAAAAAA=="  # 32-byte placeholder
-_fernet = Fernet(Fernet.generate_key())  # clé aléatoire par run en POC
-
-def encrypt_payload(data: dict) -> str:
-    raw = json.dumps(data).encode()
-    return base64.b64encode(_fernet.encrypt(raw)).decode()
-
-def build_envelope(row: dict, idx: int) -> dict:
-    return {
-        "eventId":   f"evt-{idx:08d}",
-        "table":     "payments",
-        "operation": "INSERT",
-        "payload":   encrypt_payload(row),
-        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-    }
-
-def main():
-    parser = argparse.ArgumentParser(description="Kafka Payment Producer")
-    parser.add_argument("--csv",       required=True,           help="Chemin vers le CSV Kaggle")
-    parser.add_argument("--bootstrap", default="localhost:9094", help="Kafka bootstrap server")
-    parser.add_argument("--topic",     default="payments",      help="Topic Kafka cible")
-    parser.add_argument("--rate",      type=float, default=10,  help="Messages par seconde")
-    parser.add_argument("--limit",     type=int,   default=0,   help="Limite de lignes (0=toutes)")
-    args = parser.parse_args()
-
-    print(f"[Producer] Lecture de {args.csv}")
-    df = pd.read_csv(args.csv)
-    if args.limit > 0:
-        df = df.head(args.limit)
-    print(f"[Producer] {len(df)} lignes chargées")
-
-    producer = KafkaProducer(
-        bootstrap_servers=args.bootstrap,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        acks="all",
-        retries=5,
-        linger_ms=10,
-    )
-
-    interval = 1.0 / args.rate if args.rate > 0 else 0
-    sent = 0
-    for i, row in df.iterrows():
-        envelope = build_envelope(row.to_dict(), i)
-        producer.send(args.topic, value=envelope)
-        sent += 1
-        if sent % 100 == 0:
-            print(f"[Producer] {sent}/{len(df)} messages envoyés")
-        if interval > 0:
-            time.sleep(interval)
-
-    producer.flush()
-    print(f"[Producer] ✓ {sent} messages publiés sur '{args.topic}'")
-
-if __name__ == "__main__":
-    main()
-PYEOF
-
-  chmod +x "$SCRIPTS_DIR/producer.py"
-  success "Script producer.py généré dans $SCRIPTS_DIR"
-}
+# Note: producer.py is now a tracked source file in producer/.
+# Same for the 4 PyFlink jobs in flink-jobs/.
 
 # Nettoyage des résidus Helm/RBAC avant apply (évite les conflits lors d'un re-déploiement)
 cleanup_before_deploy() {
@@ -852,33 +861,115 @@ _tf_import_if_missing() {
   cd - > /dev/null
 }
 
-apply_terraform() {
-  step "Application de l'infrastructure Terraform"
+# Fernet key — generated once, persisted at FERNET_KEY_FILE, shared by producer + Job 1
+ensure_fernet_key() {
+  if [[ -s "$FERNET_KEY_FILE" ]]; then
+    return 0
+  fi
+  log "Génération de la clé Fernet (sauvegardée dans $FERNET_KEY_FILE)"
+  python3 - <<'PY' > "$FERNET_KEY_FILE"
+from cryptography.fernet import Fernet
+print(Fernet.generate_key().decode(), end="")
+PY
+  chmod 600 "$FERNET_KEY_FILE"
+  success "Clé Fernet générée"
+}
 
-  # ── Étape 1 : tout sauf les ressources CRD-dépendantes ───────────────────
-  # Le répertoire terraform/ ne contient PAS les manifests Kafka/Flink CRD :
-  # ils sont dans terraform/stage2/ et n'existent pas encore sur disque.
-  # => terraform plan/validate ne peut pas échouer sur des CRDs manquantes.
+apply_terraform_stage1() {
+  step "Terraform stage 1 : namespaces, opérateurs, attente CRDs"
   cd "$TERRAFORM_DIR"
-  log "terraform init (étape 1)"
   terraform init -upgrade
   _tf_import_if_missing "$TERRAFORM_DIR"
-  log "terraform apply — étape 1 : namespaces, operators, attente CRDs"
   terraform apply -auto-approve
   cd - > /dev/null
+  success "Stage 1 appliqué"
+}
 
-  # ── Étape 2 : ressources CRD-dépendantes ─────────────────────────────────
-  # generate_stage2_files() a déjà écrit terraform/stage2/ sur disque.
-  # Les CRDs sont maintenant Established → le provider peut les valider.
+apply_terraform_stage2() {
+  step "Terraform stage 2 : Kafka cluster + topics + Fernet + FlinkDeployments"
+  ensure_fernet_key
+  export TF_VAR_fernet_key="$(cat "$FERNET_KEY_FILE")"
   local S2="$TERRAFORM_DIR/stage2"
   cd "$S2"
-  log "terraform init (étape 2 — stage2)"
   terraform init -upgrade
-  log "terraform apply — étape 2 : Kafka cluster, topics, FlinkDeployment"
   terraform apply -auto-approve
   cd - > /dev/null
+  unset TF_VAR_fernet_key
+  success "Stage 2 appliqué"
+}
 
-  success "Infrastructure Terraform appliquée (étapes 1 + 2)"
+# ── Build the PyFlink jobs image directly inside minikube's Docker daemon ─
+build_jobs_image() {
+  step "Build de l'image PyFlink (${JOBS_IMAGE}) dans minikube"
+  if [[ ! -f "$JOBS_DIR/Dockerfile" ]]; then
+    error "Dockerfile introuvable dans $JOBS_DIR"
+  fi
+  # Switch docker CLI to talk to minikube's docker daemon, then build.
+  # This avoids `docker save | minikube image load` round-trip and works with the docker driver.
+  log "eval \$(minikube docker-env) && docker build ..."
+  eval "$(minikube -p minikube docker-env --shell bash)"
+  docker build -t "$JOBS_IMAGE" "$JOBS_DIR"
+  success "Image $JOBS_IMAGE disponible dans le docker daemon de minikube"
+}
+
+# ── Wait for the 4 FlinkDeployments to reach STABLE ─────────────────────
+wait_for_jobs() {
+  step "Attente du démarrage des 4 jobs Flink"
+  for job in job1-decryption job2-validation job3-normalization job4-sink; do
+    log "  $job ..."
+    local elapsed=0
+    while true; do
+      local phase
+      phase=$(kubectl -n "$FLINK_NAMESPACE" get flinkdeployment "$job" \
+                -o jsonpath='{.status.lifecycleState}' 2>/dev/null || echo "")
+      [[ "$phase" == "STABLE" ]] && { success "  $job : STABLE"; break; }
+      if (( elapsed >= 300 )); then
+        warn "  $job : non-stable après ${elapsed}s (état=$phase) — vérifier kubectl logs"
+        break
+      fi
+      sleep 5; (( elapsed += 5 ))
+    done
+  done
+}
+
+# ── Run the local producer against the minikube nodeport ────────────────
+produce_csv() {
+  local csv="${1:-}"
+  [[ -z "$csv" ]] && error "Usage : $0 produce <chemin/vers/data.csv> [rate] [limit]"
+  [[ ! -f "$csv" ]] && error "Fichier introuvable : $csv"
+  local rate="${2:-20}"
+  local limit="${3:-0}"
+
+  ensure_fernet_key
+  local mip kport bootstrap
+  mip=$(minikube ip)
+  kport=$(kubectl -n "$KAFKA_NAMESPACE" get svc "${KAFKA_CLUSTER_NAME}-kafka-external-bootstrap" \
+           -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "")
+  [[ -z "$kport" ]] && error "NodePort Kafka introuvable — l'infra est-elle prête ?"
+  bootstrap="${mip}:${kport}"
+
+  log "Producer → broker $bootstrap, topic payments, rate=${rate}/s limit=${limit}"
+  PRODUCER_VENV="$(pwd)/.producer-venv"
+  if [[ ! -d "$PRODUCER_VENV" ]]; then
+    log "Création du venv producteur..."
+    if ! python3 -m venv "$PRODUCER_VENV" 2>/dev/null; then
+      log "python3-venv absent — installation via apt..."
+      sudo apt-get install -y python3-venv -qq
+      python3 -m venv "$PRODUCER_VENV"
+    fi
+  fi
+  if ! "$PRODUCER_VENV/bin/python" -c "import kafka, pandas, cryptography" 2>/dev/null; then
+    log "Installation des dépendances Python (kafka-python, pandas, cryptography)..."
+    "$PRODUCER_VENV/bin/pip" install --quiet -r "$PRODUCER_DIR/requirements.txt"
+  fi
+
+  FERNET_KEY="$(cat "$FERNET_KEY_FILE")" \
+    PYTHONPATH="$JOBS_DIR" \
+    "$PRODUCER_VENV/bin/python" "$PRODUCER_DIR/producer.py" \
+      --csv "$csv" \
+      --bootstrap "$bootstrap" \
+      --rate "$rate" \
+      --limit "$limit"
 }
 
 #  Application RBAC & network policies
@@ -893,24 +984,23 @@ apply_k8s_extras() {
 wait_for_components() {
   step "Attente de la disponibilité des composants"
 
+  log "Attente du pod Strimzi operator (Running)…"
+  kubectl rollout status deployment/strimzi-cluster-operator \
+    -n "$KAFKA_NAMESPACE" \
+    --timeout=120s
+
   log "Attente de Kafka (KafkaCluster ready)…"
   kubectl wait kafka/"$KAFKA_CLUSTER_NAME" \
     -n "$KAFKA_NAMESPACE" \
     --for=condition=Ready \
-    --timeout=300s
+    --timeout=600s
 
   log "Attente de MinIO…"
   kubectl rollout status deployment/minio \
     -n "$MINIO_NAMESPACE" \
     --timeout=180s
 
-  log "Attente de Flink JobManager…"
-  kubectl wait pod \
-    -l "app=poc-pipeline,component=jobmanager" \
-    -n "$FLINK_NAMESPACE" \
-    --for=condition=Ready \
-    --timeout=300s || warn "JobManager pas encore prêt — vérifier avec: kubectl get pods -n $FLINK_NAMESPACE"
-  success "Tous les composants sont opérationnels"
+  success "Kafka + MinIO opérationnels"
 }
 
 #Affichage du résumé
@@ -921,49 +1011,44 @@ print_summary() {
 
   echo -e """
 ${GREEN}╔══════════════════════════════════════════════════════════╗
-║          POC PIPELINE — Infrastructure prête             ║
+║       RT-Payments Pipeline — Infrastructure prête        ║
 ╚══════════════════════════════════════════════════════════╝${NC}
 
-${CYAN}Namespaces :${NC}
-  kubectl get pods -n $KAFKA_NAMESPACE    # ingestion  (Kafka / Strimzi)
-  kubectl get pods -n $FLINK_NAMESPACE    # traitement (Apache Flink)
-  kubectl get pods -n $MINIO_NAMESPACE    # stockage   (MinIO)
+${CYAN}Pipeline :${NC}
+  producer.py
+      ↓ payments              (envelope chiffré Fernet)
+  Job 1 — Décryption          flinkdeployment/job1-decryption
+      ↓ payments.decrypted
+  Job 2 — Validation          flinkdeployment/job2-validation
+      ↓ payments.validated         ↘ payments.dlq  (rejets ISO)
+  Job 3 — Normalisation       flinkdeployment/job3-normalization
+      ↓ payments.normalized   (canonique, ISO 8601 / PCI mask / MCC enrichi)
+  Job 4 — Sink                flinkdeployment/job4-sink
+      ↓ s3a://${MINIO_BUCKET}/canonical/businessDate=YYYY-MM-DD/mti=XXXX/
 
-${CYAN}Couche Ingestion — Kafka (Strimzi/KRaft) :${NC}
-  Bootstrap interne : ${KAFKA_CLUSTER_NAME}-kafka-bootstrap.${KAFKA_NAMESPACE}.svc:9092
-  Bootstrap externe : ${MINIKUBE_IP}:<nodeport>
-  Topics            : $KAFKA_TOPIC_PAYMENTS, $KAFKA_TOPIC_DLQ
+${CYAN}Statut des jobs :${NC}
+  kubectl get flinkdeployment -n $FLINK_NAMESPACE
+  kubectl get pods -n $FLINK_NAMESPACE
+  kubectl logs -n $FLINK_NAMESPACE -l app=job1-decryption -c flink-main-container --tail=50
 
-  # Lister les topics
-  kubectl exec -n $KAFKA_NAMESPACE -it \$(kubectl get pod -n $KAFKA_NAMESPACE -l strimzi.io/name=${KAFKA_CLUSTER_NAME}-kafka -o jsonpath='{.items[0].metadata.name}') \\
-    -- bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+${CYAN}Flink UI (par job) :${NC}
+  kubectl port-forward -n $FLINK_NAMESPACE svc/job1-decryption-rest 8081:8081
+  # → http://localhost:8081
 
-${CYAN}Couche Traitement — Apache Flink :${NC}
-  API REST : kubectl port-forward svc/poc-pipeline-rest 8081:8081 -n $FLINK_NAMESPACE
-  UI       : http://localhost:8081
+${CYAN}MinIO :${NC}
+  kubectl port-forward -n $MINIO_NAMESPACE svc/minio-console 9001:9001
+  # → http://localhost:9001  ($MINIO_ACCESS_KEY / $MINIO_SECRET_KEY)
+  Bucket : $MINIO_BUCKET
 
-${CYAN}Couche Stockage — MinIO :${NC}
-  Console  : kubectl port-forward svc/minio-console 9001:9001 -n $MINIO_NAMESPACE
-  UI       : http://localhost:9001  (${MINIO_ACCESS_KEY} / ${MINIO_SECRET_KEY})
-  Bucket   : $MINIO_BUCKET
+${CYAN}Lancer le producer :${NC}
+  ./setup_poc.sh produce <chemin/vers/csv> [rate=20] [limit=0]
 
-${CYAN}Producer (local → couche ingestion) :${NC}
-  # Exposer le port Kafka NodePort
-  KAFKA_PORT=\$(kubectl get svc ${KAFKA_CLUSTER_NAME}-kafka-external-bootstrap \\
-    -n $KAFKA_NAMESPACE -o jsonpath='{.spec.ports[0].nodePort}')
-  python3 $SCRIPTS_DIR/producer.py \\
-    --csv <votre_kaggle.csv> \\
-    --bootstrap ${MINIKUBE_IP}:\$KAFKA_PORT \\
-    --rate 50
+${CYAN}Inspecter les topics :${NC}
+  kubectl exec -n $KAFKA_NAMESPACE -it ${KAFKA_CLUSTER_NAME}-kafka-0 -- \\
+    bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \\
+    --topic payments.normalized --from-beginning --max-messages 5
 
-${CYAN}Prochaines étapes :${NC}
-  1. Compiler les 4 jobs Flink (Maven/Gradle) → JARs
-  2. Soumettre via REST : POST http://localhost:8081/jars/upload
-  3. Valider le flux bout-en-bout : Producer → Kafka → Flink → MinIO
-
-${YELLOW}Arrêter l'environnement :${NC}
-  cd $TERRAFORM_DIR && terraform destroy -auto-approve
-  minikube stop
+${YELLOW}Arrêter :${NC}  ./setup_poc.sh down
 """
 }
 
@@ -1066,16 +1151,24 @@ teardown() {
   success "Infrastructure détruite et Minikube arrêté — prêt pour un nouveau 'up'"
 }
 
-#  Point d'entrée 
+#  Point d'entrée
 usage() {
   echo -e """
 Usage : $0 [COMMANDE]
 
-  up        Créer toute l'infrastructure (défaut)
-  down      Détruire l'infrastructure
-  plan      Afficher le plan Terraform sans appliquer
-  status    Afficher le statut des pods
-  help      Afficher cette aide
+  up                    Infrastructure complète (Minikube + opérateurs + jobs)
+  build                 Construire l'image PyFlink dans le docker daemon de minikube
+  jobs                  Réappliquer uniquement les 4 FlinkDeployments (stage2)
+  produce <csv> [rate] [limit]
+                        Lancer le producer en local vers le NodePort Kafka
+  down                  Détruire toute l'infrastructure
+  plan                  Plan Terraform (partiel — sans CRDs)
+  status                Statut des pods dans les 3 namespaces
+  help                  Afficher cette aide
+
+Variables :
+  JOBS_IMAGE  (défaut: $JOBS_IMAGE)
+  FERNET_KEY  (auto-généré dans .fernet.key)
 """
 }
 
@@ -1087,12 +1180,25 @@ main() {
       generate_terraform_files
       generate_stage2_files
       generate_k8s_manifests
-      generate_producer_script
       cleanup_before_deploy
-      apply_terraform
-      apply_k8s_extras
-      wait_for_components
+      apply_terraform_stage1     # operators + namespaces + CRD wait
+      apply_k8s_extras           # flink SA + NetworkPolicies (must exist before FlinkDeployments)
+      build_jobs_image           # image must exist before stage2 (imagePullPolicy=Never)
+      apply_terraform_stage2     # Kafka cluster + topics + Fernet + 4 FlinkDeployments
+      wait_for_components        # Kafka cluster Ready + MinIO rollout
+      wait_for_jobs              # 4 FlinkDeployments STABLE
       print_summary
+      ;;
+    build)
+      build_jobs_image
+      ;;
+    jobs)
+      apply_terraform_stage2
+      wait_for_jobs
+      ;;
+    produce)
+      shift
+      produce_csv "$@"
       ;;
     down)
       teardown

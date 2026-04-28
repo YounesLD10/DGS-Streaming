@@ -1,0 +1,6 @@
+apache-flink==1.18.1
+# numpy 2.x has breaking changes; flink 1.18 was tested with 1.x
+numpy<2
+# pyarrow 14+ drops Python 3.7 wheels and bumps protobuf; stay on the family flink 1.18 expects
+pyarrow>=5.0.0,<14
+cryptography>=42,<46
