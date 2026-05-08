@@ -1,8 +1,8 @@
 {
   "pythonPath": "/usr/bin/python3",
-  "venvPath": "/home/asmae/.local/lib/python3.12/site-packages",
   "extraPaths": [
-    "/home/asmae/.local/lib/python3.12/site-packages"
+    "/home/asmae/.local/lib/python3.12/site-packages",
+    "/usr/lib/python3/dist-packages"
   ],
   "reportMissingModuleSource": "none"
 }

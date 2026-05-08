@@ -1,6 +1,5 @@
 {
   "python.defaultInterpreterPath": "/usr/bin/python3",
-  "python.analysis.extraPaths": [
-    "/home/asmae/.local/lib/python3.12/site-packages"
-  ]
+  "python.analysis.extraPaths": [],
+  "remote.autoForwardPortsFallback": 0
 }
