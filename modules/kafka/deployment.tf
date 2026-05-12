@@ -57,7 +57,7 @@ resource "kubernetes_deployment_v1" "kafka" {
 
           env {
             name  = "KAFKA_ADVERTISED_LISTENERS"
-            value = "PLAINTEXT://kafka-service.kafka.svc.cluster.local:9092"
+            value = "PLAINTEXT://192.168.49.2:31735"
           }
 
           env {
