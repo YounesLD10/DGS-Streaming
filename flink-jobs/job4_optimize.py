@@ -1,35 +1,45 @@
 """
-Job 4 — Optimisation
+Job 4 - Optimisation
 ====================
 Source  : Kafka 'payments.normalized'
 Process : KeyedStream by AUTHORIZATION_CODE
           OptimizeFn (KeyedProcessFunction)
-            ① Deduplication via Flink ValueState
-               – AUTHORIZATION_CODE seen before → record dropped
-               – New code                        → processed, state marked seen
-            ② Payment channel routing
-               PRODUCT_CODE = "6"  →  payment_channel = "SO_CARTE"
-               anything else       →  payment_channel = "SO_MOBILE"
-            ③ Risk scoring
+            1. Deduplication via Flink ValueState
+               - AUTHORIZATION_CODE seen before -> record dropped
+               - New code                       -> processed, state marked seen
+            2. Payment channel routing
+               PRODUCT_CODE = "6" -> payment_channel = "SO_CARTE"
+               anything else      -> payment_channel = "SO_MOBILE"
+            3. Risk scoring
                HIGH   : REJECT_CODE was filled  OR  TRANSACTION_AMOUNT > 10_000
                MEDIUM : MATCHING_STATUS not in {U, I, L}  OR  AMOUNT == 0
                LOW    : all checks pass
-            ④ Add fields: payment_channel, risk_score, optimized_at (UTC ISO 8601)
-Sink    : MinIO  rt-payments/gold/   (GoldMinioFn MapFunction, pass-through)
+            4. Add fields: payment_channel, risk_score, optimized_at (UTC ISO 8601)
+Sink    : MinIO  rt-payments/gold/   (GoldMinioSink SinkFunction - terminal)
 
 Architectural notes
 -------------------
 * KeyedProcessFunction gives each AUTHORIZATION_CODE its own isolated
-  ValueState partition — deduplication is exact and survives restarts
+  ValueState partition - deduplication is exact and survives restarts
   because Flink snapshots the state during checkpointing.
-* AuthCodeKeySelector is a class (not a lambda) to guarantee clean
-  serialization by the Flink task scheduler across JVM/Python boundary.
-* A missing or empty AUTHORIZATION_CODE is keyed as "__UNKNOWN__" so it
-  is never skipped by the deduplication logic (empty strings are not a
-  valid business key and would incorrectly deduplicate all such records).
+
+* _extract_auth_code is a plain module-level function so PyFlink's key_by
+  can call it directly via callable() - a class with only get_key() would
+  not pass the callable() check and would fail at submission time.
+
+* A missing or empty AUTHORIZATION_CODE is keyed as "__UNKNOWN__" so those
+  records are never silently deduplicated against each other (empty strings
+  are not a valid business key).
+
 * Risk scoring evaluates HIGH first so a record with both a REJECT_CODE
   and an abnormal MATCHING_STATUS is always bucketed HIGH.
-* Gold objects in MinIO carry fully enriched, deduplicated records —
+
+* GoldMinioSink is a SinkFunction (not a MapFunction) so it is the
+  terminal operator that drives Flink execution. A plain MapFunction with
+  no downstream sink is pruned by the Flink execution planner at job
+  submission time - the MinIO write would never happen.
+
+* Gold objects in MinIO carry fully enriched, deduplicated records -
   exactly what a downstream analytical query or dashboard should read.
 """
 
@@ -49,13 +59,10 @@ from pyflink.datastream import (
     StreamExecutionEnvironment,
 )
 from pyflink.datastream.connectors.kafka import (
-    DeliveryGuarantee,
     KafkaOffsetsInitializer,
-    KafkaRecordSerializationSchema,
-    KafkaSink,
     KafkaSource,
 )
-from pyflink.datastream.functions import KeyedProcessFunction, MapFunction
+from pyflink.datastream.functions import KeyedProcessFunction, SinkFunction
 from pyflink.datastream.state import ValueStateDescriptor
 
 from common.config import (
@@ -81,23 +88,17 @@ _VALID_MATCHING_STATUSES = {"U", "I", "L"}
 _UNKNOWN_KEY = "__UNKNOWN__"
 
 
-# ── KeySelector ────────────────────────────────────────────────────────────────
+# ── Key extractor (plain function - required for PyFlink key_by callable check)
 
-class AuthCodeKeySelector:
-    """Extract AUTHORIZATION_CODE from a JSON-encoded normalised record.
-
-    Returns __UNKNOWN__ when the code is absent or empty so those records
-    are grouped together but never silently deduplicated against each other.
-    """
-
-    def get_key(self, value: str) -> str:
-        try:
-            record = json.loads(value)
-            tx = record.get("transaction", record)
-            code = str(tx.get("AUTHORIZATION_CODE", "")).strip()
-            return code if code else _UNKNOWN_KEY
-        except Exception:
-            return _UNKNOWN_KEY
+def _extract_auth_code(value: str) -> str:
+    """Return AUTHORIZATION_CODE from a JSON record, or __UNKNOWN__ if absent."""
+    try:
+        record = json.loads(value)
+        tx = record.get("transaction", record)
+        code = str(tx.get("AUTHORIZATION_CODE", "")).strip()
+        return code if code else _UNKNOWN_KEY
+    except Exception:
+        return _UNKNOWN_KEY
 
 
 # ── Business logic helpers ─────────────────────────────────────────────────────
@@ -107,17 +108,12 @@ def _payment_channel(tx: dict) -> str:
 
 
 def _risk_score(tx: dict) -> str:
-    """Compute a three-tier risk score.
-
-    Evaluated in priority order: HIGH → MEDIUM → LOW.
-    """
+    """Three-tier risk score evaluated HIGH -> MEDIUM -> LOW."""
     reject_code = str(tx.get("REJECT_CODE", "")).strip()
     matching    = str(tx.get("MATCHING_STATUS", "")).strip()
 
     try:
-        amount = float(
-            str(tx.get("TRANSACTION_AMOUNT", 0)).replace(",", ".")
-        )
+        amount = float(str(tx.get("TRANSACTION_AMOUNT", 0)).replace(",", "."))
     except (ValueError, TypeError):
         amount = 0.0
 
@@ -137,8 +133,8 @@ class OptimizeFn(KeyedProcessFunction):
     ------------
     _seen (ValueState[bool])
         Persisted per keyed partition in the Flink state backend.
-        True  → this AUTHORIZATION_CODE was already processed; drop.
-        None  → first occurrence; process and set True.
+        True -> this AUTHORIZATION_CODE was already processed; drop.
+        None -> first occurrence; process and set True.
     """
 
     def open(self, runtime_context) -> None:
@@ -150,17 +146,15 @@ class OptimizeFn(KeyedProcessFunction):
     def process_element(self, value: str, ctx: KeyedProcessFunction.Context):
         current_key = ctx.get_current_key()
 
-        # ── Deduplication ──────────────────────────────────────────────────────
         # Records keyed __UNKNOWN__ are not deduplicated against each other
         # because they lack a real business key.
         if current_key != _UNKNOWN_KEY and self._seen.value():
-            log.debug("Duplicate AUTHORIZATION_CODE=%s — skipped", current_key)
-            return  # drop duplicate
+            log.debug("Duplicate AUTHORIZATION_CODE=%s - skipped", current_key)
+            return
 
         if current_key != _UNKNOWN_KEY:
             self._seen.update(True)
 
-        # ── Enrichment ────────────────────────────────────────────────────────
         try:
             record = json.loads(value)
             tx = record.get("transaction", {})
@@ -172,26 +166,23 @@ class OptimizeFn(KeyedProcessFunction):
 
             log.debug(
                 "Processed AUTHORIZATION_CODE=%s channel=%s risk=%s",
-                current_key,
-                record["payment_channel"],
-                record["risk_score"],
+                current_key, record["payment_channel"], record["risk_score"],
             )
             yield json.dumps(record, ensure_ascii=False)
 
         except Exception as exc:
-            log.error(
-                "Enrichment error AUTHORIZATION_CODE=%s: %s", current_key, exc
-            )
+            log.error("Enrichment error AUTHORIZATION_CODE=%s: %s", current_key, exc)
             raise
 
 
-# ── MapFunction (MinIO gold write, pass-through) ───────────────────────────────
+# ── SinkFunction (MinIO gold write - terminal operator) ────────────────────────
 
-class GoldMinioFn(MapFunction):
+class GoldMinioSink(SinkFunction):
     """Write each optimised record to MinIO gold layer.
 
-    Gold records are fully enriched, deduplicated, and ready for
-    analytical consumption — they represent the final state of the pipeline.
+    Using SinkFunction (not MapFunction) is critical: Flink's execution
+    planner requires a terminal sink to drive the computation graph.
+    A MapFunction with no downstream sink is pruned before the job runs.
     """
 
     def open(self, runtime_context) -> None:
@@ -199,33 +190,15 @@ class GoldMinioFn(MapFunction):
             MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY
         )
         ensure_bucket(self._client, MINIO_BUCKET)
-        log.info("GoldMinioFn: MinIO client ready (bucket=%s)", MINIO_BUCKET)
+        log.info("GoldMinioSink ready (bucket=%s prefix=%s)", MINIO_BUCKET, GOLD_PREFIX)
 
-    def map(self, value: str) -> str:
+    def invoke(self, value: str, _context) -> None:
         try:
             record = json.loads(value)
             key = write_record(self._client, MINIO_BUCKET, GOLD_PREFIX, record)
-            log.debug("gold → %s/%s", MINIO_BUCKET, key)
+            log.debug("gold -> %s/%s", MINIO_BUCKET, key)
         except Exception as exc:
             log.error("MinIO gold write failed: %s", exc)
-        return value
-
-
-# ── KafkaSink factory ──────────────────────────────────────────────────────────
-
-def _kafka_sink(topic: str) -> KafkaSink:
-    return (
-        KafkaSink.builder()
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
-        .set_record_serializer(
-            KafkaRecordSerializationSchema.builder()
-            .set_topic(topic)
-            .set_value_serialization_schema(SimpleStringSchema())
-            .build()
-        )
-        .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE)
-        .build()
-    )
 
 
 # ── Job entry point ────────────────────────────────────────────────────────────
@@ -256,10 +229,7 @@ def main() -> None:
     )
 
     # Key by AUTHORIZATION_CODE for stateful deduplication
-    keyed = raw.key_by(
-        AuthCodeKeySelector(),
-        key_type=Types.STRING(),
-    )
+    keyed = raw.key_by(_extract_auth_code, key_type=Types.STRING())
 
     processed = (
         keyed
@@ -268,12 +238,12 @@ def main() -> None:
         .name("OptimizeFn")
     )
 
-    # Write gold records to MinIO; no further Kafka forwarding — gold is terminal
+    # Terminal sink: write gold records to MinIO (SinkFunction drives execution)
     (
         processed
-        .map(GoldMinioFn(), output_type=Types.STRING())
-        .uid("gold-minio-fn")
-        .name("GoldMinioFn")
+        .add_sink(GoldMinioSink())
+        .uid("gold-minio-sink")
+        .name("GoldMinioSink")
     )
 
     log.info(

@@ -4,5 +4,6 @@
     "/home/asmae/.local/lib/python3.12/site-packages",
     "/usr/lib/python3/dist-packages"
   ],
+  "reportMissingImports": "none",
   "reportMissingModuleSource": "none"
 }
