@@ -1,97 +1,286 @@
 """
 Job 3 — Normalisation
-  Source : Kafka topic 'payments.validated'
-  Process:
-    - Convert date fields DD/MM/YYYY HH:MM → ISO 8601
-    - Convert scientific notation amounts (0,11E+02) → float
-    - Add metadata: processed_at, source_system, pipeline_version
-  Sink   : MinIO Silver (rt-payments/silver/)
-           Kafka topic  'payments.normalized'
+=====================
+Source  : Kafka 'payments.validated'
+Process : NormalizeFn (ProcessFunction)
+            • Convert all date fields (DD/MM/YYYY HH:MM) → ISO 8601 UTC
+              Fields: TRANSACTION_LOCAL_DATE, TRANSMISSION_DATE_AND_TIME,
+                      RESPONSE_DATE_AND_TIME, CAPTURE_DATE, BUSINESS_DATE,
+                      CONVERSION_RATE_DATE, ISS_SETTLEMENT_DATE,
+                      ACQ_SETTLEMENT_DATE
+            • Convert scientific-notation / comma-decimal amounts → float
+              (e.g. "0,11E+02" → 11.0)
+            • Convert TRANSACTION_AMOUNT → float
+            • Attach metadata: processed_at, source_system, pipeline_version
+Sink    : MinIO  rt-payments/silver/   (SilverMinioFn MapFunction, pass-through)
+          Kafka  payments.normalized
+
+Architectural notes
+-------------------
+* Date parsing tries multiple formats and falls back to the original string
+  rather than dropping the record — a normalisation failure should not
+  invalidate an already-validated payment.
+* Scientific notation amounts use Python's own float() after replacing
+  comma with period, which naturally handles all exponent formats.
+* TRANSACTION_AMOUNT is also normalised here (validated as numeric in
+  Job 2, but still stored as string in the decrypted payload).
+* Silver objects in MinIO are written per-record via the MinIO Python SDK
+  inside a pass-through MapFunction, matching the specified architecture.
 """
+
+import json
 import logging
 import os
+import re
 import sys
+from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.dirname(__file__))
-from common import (
-    AMOUNT_FIELDS, BATCH_SIZE, DATE_FIELDS,
-    flush_to_minio, get_consumer, get_minio,
-    get_producer, now_iso, parse_amount, parse_date,
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from pyflink.common import WatermarkStrategy
+from pyflink.common.serialization import SimpleStringSchema
+from pyflink.common.typeinfo import Types
+from pyflink.datastream import (
+    CheckpointingMode,
+    StreamExecutionEnvironment,
 )
+from pyflink.datastream.connectors.kafka import (
+    DeliveryGuarantee,
+    KafkaOffsetsInitializer,
+    KafkaRecordSerializationSchema,
+    KafkaSink,
+    KafkaSource,
+)
+from pyflink.datastream.functions import MapFunction, ProcessFunction
+
+from common.config import (
+    CHECKPOINT_INTERVAL_MS,
+    KAFKA_BOOTSTRAP,
+    MINIO_ACCESS_KEY,
+    MINIO_BUCKET,
+    MINIO_ENDPOINT,
+    MINIO_SECRET_KEY,
+    PIPELINE_VERSION,
+    SOURCE_SYSTEM,
+    TOPIC_NORMALIZED,
+    TOPIC_VALIDATED,
+)
+from common.minio_sink import ensure_bucket, get_minio_client, write_record
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [job3-normalize] %(message)s",
-    datefmt="%H:%M:%S",
+    format="%(asctime)s [job3-normalize] %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-INPUT_TOPIC  = "payments.validated"
-OUTPUT_TOPIC = "payments.normalized"
-SILVER       = "silver"
+SILVER_PREFIX = "silver"
 
-SOURCE_SYSTEM      = "HPS_SWAM"
-PIPELINE_VERSION   = "1.0.0"
+# All date fields present in an HPS SWAM transaction record
+DATE_FIELDS = [
+    "TRANSACTION_LOCAL_DATE",
+    "TRANSMISSION_DATE_AND_TIME",
+    "RESPONSE_DATE_AND_TIME",
+    "CAPTURE_DATE",
+    "BUSINESS_DATE",
+    "CONVERSION_RATE_DATE",
+    "ISS_SETTLEMENT_DATE",
+    "ACQ_SETTLEMENT_DATE",
+]
+
+# Formats attempted in order; first match wins
+_DATE_FORMATS = [
+    "%d/%m/%Y %H:%M",
+    "%d/%m/%Y",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d",
+]
+
+# Matches "0,11E+02", "1,5e3", "700", "1.5", "-3,14E-01" etc.
+_SCI_PATTERN = re.compile(r"^-?[\d]+(?:[,.][\d]+)?(?:[eE][+\-]?\d+)?$")
 
 
-def _normalize(tx: dict) -> dict:
-    """Return a new dict with normalized date and amount fields."""
-    normalized = dict(tx)
+# ── Normalisation helpers ──────────────────────────────────────────────────────
+
+def _parse_date(raw) -> str | None:
+    """Return ISO 8601 UTC string or the original value if unparseable."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    for fmt in _DATE_FORMATS:
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.replace(tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            continue
+    # Return as-is rather than dropping — do not invalidate the record
+    return s
+
+
+def _parse_amount(raw) -> float | None:
+    """Parse numeric strings including comma-decimal scientific notation.
+
+    Examples
+    --------
+    "700"       → 700.0
+    "0,11E+02"  → 11.0
+    "1.50"      → 1.5
+    ""          → None
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if not _SCI_PATTERN.match(s):
+        return None
+    try:
+        return float(s.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _normalize_transaction(tx: dict) -> dict:
+    """Return a new dict with dates and amounts normalised."""
+    out = dict(tx)
 
     for field in DATE_FIELDS:
-        if field in normalized:
-            normalized[field] = parse_date(normalized[field])
+        if field in out:
+            out[field] = _parse_date(out[field])
 
-    for field in AMOUNT_FIELDS:
-        if field in normalized:
-            normalized[field] = parse_amount(normalized[field])
+    if "TRANSACTION_AMOUNT" in out:
+        normalised = _parse_amount(out["TRANSACTION_AMOUNT"])
+        if normalised is not None:
+            out["TRANSACTION_AMOUNT"] = normalised
 
-    # TRANSACTION_AMOUNT as float (already in list, but ensure it's done)
-    if "TRANSACTION_AMOUNT" in normalized:
-        val = parse_amount(normalized["TRANSACTION_AMOUNT"])
-        normalized["TRANSACTION_AMOUNT"] = val if val is not None else normalized["TRANSACTION_AMOUNT"]
-
-    return normalized
+    return out
 
 
-def run() -> None:
-    minio    = get_minio()
-    producer = get_producer()
-    consumer = get_consumer(INPUT_TOPIC, "job3-normalize")
+# ── ProcessFunction ────────────────────────────────────────────────────────────
 
-    log.info(f"Consuming '{INPUT_TOPIC}' → normalize → Silver + '{OUTPUT_TOPIC}'")
+class NormalizeFn(ProcessFunction):
+    """Normalise dates, amounts, and attach pipeline metadata."""
 
-    batch     = []
-    processed = 0
+    def open(self, runtime_context) -> None:
+        log.info("NormalizeFn ready")
 
-    try:
-        for msg in consumer:
-            record = msg.value
-            tx     = record.get("transaction", {})
+    def process_element(self, value: str, ctx: ProcessFunction.Context):
+        try:
+            record = json.loads(value)
+            tx = record.get("transaction", {})
 
-            record["transaction"]      = _normalize(tx)
-            record["processed_at"]     = now_iso()
+            record["transaction"]      = _normalize_transaction(tx)
+            record["processed_at"]     = datetime.now(timezone.utc).isoformat()
             record["source_system"]    = SOURCE_SYSTEM
             record["pipeline_version"] = PIPELINE_VERSION
-            record["_job"]             = "normalize"
+            record.setdefault("_meta", {})["job"] = "job3-normalize"
 
-            batch.append(record)
-            producer.send(OUTPUT_TOPIC, value=record)
-            processed += 1
+            yield json.dumps(record, ensure_ascii=False)
 
-            if len(batch) >= BATCH_SIZE:
-                flush_to_minio(minio, batch, SILVER, log)
-                log.info(f"Processed: {processed}")
-                batch = []
+        except Exception as exc:
+            log.error("Normalisation error eventId=%s: %s", None, exc)
+            # Re-raise so Flink marks the record as failed and checkpointing
+            # can replay it rather than silently losing data
+            raise
 
-    except Exception as exc:
-        log.error(f"Consumer error: {exc}")
-    finally:
-        if batch:
-            flush_to_minio(minio, batch, SILVER, log)
-        producer.flush()
-        log.info(f"Done. processed={processed}")
+
+# ── MapFunction (MinIO silver write, pass-through) ─────────────────────────────
+
+class SilverMinioFn(MapFunction):
+    """Write each normalised record to MinIO silver layer.
+
+    Mirrors BronzeMinioFn in Job 1 — MinIO failures are logged but
+    do not interrupt the main pipeline in the PoC environment.
+    """
+
+    def open(self, runtime_context) -> None:
+        self._client = get_minio_client(
+            MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY
+        )
+        ensure_bucket(self._client, MINIO_BUCKET)
+        log.info("SilverMinioFn: MinIO client ready (bucket=%s)", MINIO_BUCKET)
+
+    def map(self, value: str) -> str:
+        try:
+            record = json.loads(value)
+            key = write_record(self._client, MINIO_BUCKET, SILVER_PREFIX, record)
+            log.debug("silver → %s/%s", MINIO_BUCKET, key)
+        except Exception as exc:
+            log.error("MinIO silver write failed: %s", exc)
+        return value
+
+
+# ── KafkaSink factory ──────────────────────────────────────────────────────────
+
+def _kafka_sink(topic: str) -> KafkaSink:
+    return (
+        KafkaSink.builder()
+        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
+        .set_record_serializer(
+            KafkaRecordSerializationSchema.builder()
+            .set_topic(topic)
+            .set_value_serialization_schema(SimpleStringSchema())
+            .build()
+        )
+        .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+        .build()
+    )
+
+
+# ── Job entry point ────────────────────────────────────────────────────────────
+
+def main() -> None:
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+    env.enable_checkpointing(CHECKPOINT_INTERVAL_MS)
+    env.get_checkpoint_config().set_checkpointing_mode(CheckpointingMode.EXACTLY_ONCE)
+    env.get_checkpoint_config().set_min_pause_between_checkpoints(5_000)
+    env.get_checkpoint_config().set_checkpoint_timeout(60_000)
+    env.get_checkpoint_config().set_max_concurrent_checkpoints(1)
+
+    source = (
+        KafkaSource.builder()
+        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
+        .set_topics(TOPIC_VALIDATED)
+        .set_group_id("flink-job3-normalize")
+        .set_starting_offsets(KafkaOffsetsInitializer.earliest())
+        .set_value_only_deserializer(SimpleStringSchema())
+        .build()
+    )
+
+    raw = env.from_source(
+        source,
+        WatermarkStrategy.no_watermarks(),
+        "payments-validated-source",
+    )
+
+    processed = (
+        raw
+        .process(NormalizeFn(), output_type=Types.STRING())
+        .uid("normalize-fn")
+        .name("NormalizeFn")
+    )
+
+    # Write normalised records to MinIO silver, then forward to Kafka
+    (
+        processed
+        .map(SilverMinioFn(), output_type=Types.STRING())
+        .uid("silver-minio-fn")
+        .name("SilverMinioFn")
+        .sink_to(_kafka_sink(TOPIC_NORMALIZED))
+        .uid("payments-normalized-sink")
+        .name("payments.normalized sink")
+    )
+
+    log.info(
+        "Submitting job: rt-payments-job3-normalization | "
+        "source=%s | out=%s",
+        TOPIC_VALIDATED, TOPIC_NORMALIZED,
+    )
+    env.execute("rt-payments-job3-normalization")
 
 
 if __name__ == "__main__":
-    run()
+    main()
