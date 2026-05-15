@@ -24,12 +24,19 @@ RUN apt-get update -y \
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
 
-# ── Flink Kafka connector JAR ─────────────────────────────────────────────────
-# flink-connector-kafka 3.2.0-1.19 is the stable release for Flink 1.19.
-# Placed in /opt/flink/lib/ so it is auto-loaded by the Flink class loader
-# without any env.add_jars() call in the Python job code.
+# ── Flink Kafka connector JARs ────────────────────────────────────────────────
+# flink-connector-kafka-3.2.0-1.19 is the connector for Flink 1.19, but it is
+# a thin JAR — it does NOT bundle kafka-clients.  Without kafka-clients on the
+# classpath, Flink raises NoClassDefFoundError for OffsetResetStrategy at
+# job submission time.  Both JARs must be in /opt/flink/lib/ together.
+#
+# Versions pinned:
+#   flink-connector-kafka 3.2.0-1.19  (matches Flink 1.19.x)
+#   kafka-clients         3.4.0        (the version the connector was built against)
 RUN wget -q -P /opt/flink/lib/ \
-    "https://repo.maven.apache.org/maven2/org/apache/flink/flink-connector-kafka/3.2.0-1.19/flink-connector-kafka-3.2.0-1.19.jar"
+    "https://repo.maven.apache.org/maven2/org/apache/flink/flink-connector-kafka/3.2.0-1.19/flink-connector-kafka-3.2.0-1.19.jar" \
+ && wget -q -P /opt/flink/lib/ \
+    "https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-clients/3.4.0/kafka-clients-3.4.0.jar"
 
 # ── Job files ─────────────────────────────────────────────────────────────────
 RUN mkdir -p /opt/jobs

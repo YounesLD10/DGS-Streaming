@@ -7,6 +7,7 @@ and publishes to a Kafka topic.
 """
 import argparse
 import json
+import os
 import re
 import socket
 import time
@@ -65,7 +66,8 @@ def main():
     if args.rate <= 0:
         raise ValueError("--rate must be greater than 0")
 
-    key = Fernet.generate_key()
+    key_env = os.getenv("FERNET_KEY", "")
+    key = key_env.encode() if key_env else Fernet.generate_key()
     fernet = Fernet(key)
     print(f"[producer] Fernet key (save to decrypt): {key.decode()}")
 
