@@ -15,7 +15,7 @@ Process : KeyedStream by AUTHORIZATION_CODE
                MEDIUM : MATCHING_STATUS not in {U, I, L}  OR  AMOUNT == 0
                LOW    : all checks pass
             4. Add fields: payment_channel, risk_score, optimized_at (UTC ISO 8601)
-Sink    : MinIO  rt-payments/gold/   (GoldMinioSink SinkFunction - terminal)
+Sink    : MinIO  rt-payments/gold/   (GoldMinioFn MapFunction + .print() terminal)
 
 Architectural notes
 -------------------
@@ -34,10 +34,12 @@ Architectural notes
 * Risk scoring evaluates HIGH first so a record with both a REJECT_CODE
   and an abnormal MATCHING_STATUS is always bucketed HIGH.
 
-* GoldMinioSink is a SinkFunction (not a MapFunction) so it is the
-  terminal operator that drives Flink execution. A plain MapFunction with
-  no downstream sink is pruned by the Flink execution planner at job
-  submission time - the MinIO write would never happen.
+* In PyFlink 1.19, SinkFunction is JavaFunctionWrapper — its __init__
+  requires a Java object (not Python inheritance). There is no Python-
+  subclassable sink base class in the DataStream Python API. The correct
+  pattern is MapFunction for the MinIO write (as a side-effect pass-through)
+  followed by .print() which wraps PrintSinkFunction (a real Java sink) and
+  acts as the terminal operator that drives Flink's execution graph.
 
 * Gold objects in MinIO carry fully enriched, deduplicated records -
   exactly what a downstream analytical query or dashboard should read.
@@ -62,7 +64,7 @@ from pyflink.datastream.connectors.kafka import (
     KafkaOffsetsInitializer,
     KafkaSource,
 )
-from pyflink.datastream.functions import KeyedProcessFunction, SinkFunction
+from pyflink.datastream.functions import KeyedProcessFunction, MapFunction
 from pyflink.datastream.state import ValueStateDescriptor
 
 from common.config import (
@@ -175,14 +177,15 @@ class OptimizeFn(KeyedProcessFunction):
             raise
 
 
-# ── SinkFunction (MinIO gold write - terminal operator) ────────────────────────
+# ── MapFunction (MinIO gold write, pass-through) ───────────────────────────────
 
-class GoldMinioSink(SinkFunction):
-    """Write each optimised record to MinIO gold layer.
+class GoldMinioFn(MapFunction):
+    """Write each optimised record to MinIO gold layer and pass the value through.
 
-    Using SinkFunction (not MapFunction) is critical: Flink's execution
-    planner requires a terminal sink to drive the computation graph.
-    A MapFunction with no downstream sink is pruned before the job runs.
+    MapFunction is used because PyFlink's SinkFunction is JavaFunctionWrapper
+    and requires a Java object in __init__ — it cannot be subclassed in Python.
+    The downstream .print() call provides the required terminal Java-backed
+    operator that drives Flink's execution graph.
     """
 
     def open(self, runtime_context) -> None:
@@ -190,15 +193,16 @@ class GoldMinioSink(SinkFunction):
             MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY
         )
         ensure_bucket(self._client, MINIO_BUCKET)
-        log.info("GoldMinioSink ready (bucket=%s prefix=%s)", MINIO_BUCKET, GOLD_PREFIX)
+        log.info("GoldMinioFn ready (bucket=%s prefix=%s)", MINIO_BUCKET, GOLD_PREFIX)
 
-    def invoke(self, value: str, _context) -> None:
+    def map(self, value: str) -> str:
         try:
             record = json.loads(value)
             key = write_record(self._client, MINIO_BUCKET, GOLD_PREFIX, record)
             log.debug("gold -> %s/%s", MINIO_BUCKET, key)
         except Exception as exc:
             log.error("MinIO gold write failed: %s", exc)
+        return value
 
 
 # ── Job entry point ────────────────────────────────────────────────────────────
@@ -238,12 +242,14 @@ def main() -> None:
         .name("OptimizeFn")
     )
 
-    # Terminal sink: write gold records to MinIO (SinkFunction drives execution)
+    # Write gold records to MinIO; .print() is the terminal Java-backed operator
+    # that drives Flink's execution graph (SinkFunction cannot be subclassed in Python).
     (
         processed
-        .add_sink(GoldMinioSink())
-        .uid("gold-minio-sink")
-        .name("GoldMinioSink")
+        .map(GoldMinioFn(), output_type=Types.STRING())
+        .uid("gold-minio-fn")
+        .name("GoldMinioFn")
+        .print()
     )
 
     log.info(
