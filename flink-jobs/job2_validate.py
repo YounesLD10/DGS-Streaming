@@ -130,7 +130,7 @@ class ValidateFn(ProcessFunction):
     def open(self, runtime_context) -> None:
         log.info("ValidateFn ready")
 
-    def process_element(self, value: str, ctx: ProcessFunction.Context):
+    def process_element(self, value: str, _):
         try:
             record = json.loads(value)
             tx = record.get("transaction", {})
@@ -151,7 +151,7 @@ class ValidateFn(ProcessFunction):
                     "INVALID eventId=%s reason=%s",
                     record.get("eventId"), reason,
                 )
-                ctx.output(DLQ_TAG, json.dumps(record, ensure_ascii=False))
+                yield DLQ_TAG, json.dumps(record, ensure_ascii=False)
 
         except Exception as exc:
             # Malformed records go to DLQ with an PARSE_ERROR reason
@@ -166,7 +166,7 @@ class ValidateFn(ProcessFunction):
                 },
             }
             log.error("Parse error in validation: %s", exc)
-            ctx.output(DLQ_TAG, json.dumps(dlq, ensure_ascii=False))
+            yield DLQ_TAG, json.dumps(dlq, ensure_ascii=False)
 
 
 # ── KafkaSink factory ──────────────────────────────────────────────────────────

@@ -63,7 +63,7 @@ from common.config import (
     TOPIC_DLQ,
     TOPIC_PAYMENTS,
 )
-from common.crypto import fernet_decrypt, make_fernet
+from common.crypto import Fernet, fernet_decrypt, make_fernet
 from common.minio_sink import ensure_bucket, get_minio_client, write_record
 
 logging.basicConfig(
@@ -90,13 +90,13 @@ class DecryptFn(ProcessFunction):
 
     def __init__(self, fernet_key: str) -> None:
         self._key = fernet_key
-        self._fernet = None  # initialised in open() to avoid pickle issues
+        self._fernet: Fernet | None = None  # initialised in open() to avoid pickle issues
 
     def open(self, runtime_context) -> None:
         self._fernet = make_fernet(self._key)
         log.info("DecryptFn ready (Fernet cipher initialised)")
 
-    def process_element(self, value: str, ctx: ProcessFunction.Context):
+    def process_element(self, value: str, _):
         try:
             envelope = json.loads(value)
             raw_payload = envelope.get("payload", "")
@@ -104,6 +104,7 @@ class DecryptFn(ProcessFunction):
             if not raw_payload:
                 raise ValueError("envelope.payload is empty")
 
+            assert self._fernet is not None, "open() was not called before process_element()"
             decrypted_str = fernet_decrypt(self._fernet, raw_payload)
             transaction = json.loads(decrypted_str)
 
@@ -141,7 +142,7 @@ class DecryptFn(ProcessFunction):
                 },
             }
             log.warning("Decrypt error eventId=%s: %s", env_safe.get("eventId"), exc)
-            ctx.output(DLQ_TAG, json.dumps(dlq, ensure_ascii=False))
+            yield DLQ_TAG, json.dumps(dlq, ensure_ascii=False)
 
 
 # ── MapFunction (MinIO bronze write, pass-through) ─────────────────────────────
