@@ -63,7 +63,7 @@ from common.config import (
     TOPIC_DLQ,
     TOPIC_PAYMENTS,
 )
-from common.crypto import Fernet, fernet_decrypt, make_fernet
+from common.crypto import Fernet, InvalidToken, fernet_decrypt, make_fernet
 from common.minio_sink import ensure_bucket, get_minio_client, write_record
 
 logging.basicConfig(
@@ -121,8 +121,32 @@ class DecryptFn(ProcessFunction):
             }
             yield json.dumps(record, ensure_ascii=False)
 
+        except InvalidToken:
+            # Fernet key mismatch or corrupted payload — explicit named category
+            # so DLQ consumers can filter by error_type without parsing the message.
+            try:
+                env_safe = json.loads(value)
+                event_id = env_safe.get("eventId")
+                env_safe.pop("payload", None)
+            except Exception:
+                env_safe = {}
+                event_id = None
+
+            dlq = {
+                "eventId":    event_id,
+                "error":      "Fernet decryption failed: key mismatch or corrupted payload",
+                "error_type": "INVALID_FERNET_TOKEN",
+                "envelope_meta": {k: v for k, v in env_safe.items() if k != "payload"},
+                "_meta": {
+                    "errorAt": datetime.now(timezone.utc).isoformat(),
+                    "job":     "job1-decrypt",
+                },
+            }
+            log.warning("INVALID_FERNET_TOKEN eventId=%s — record routed to DLQ", event_id)
+            yield DLQ_TAG, json.dumps(dlq, ensure_ascii=False)
+
         except Exception as exc:
-            # Build a DLQ record that carries only metadata — no raw payload
+            # All other errors (JSON parse, missing fields, etc.)
             try:
                 env_safe = json.loads(value)
                 env_safe.pop("payload", None)
@@ -133,15 +157,13 @@ class DecryptFn(ProcessFunction):
                 "eventId":      env_safe.get("eventId"),
                 "error":        str(exc),
                 "error_type":   type(exc).__name__,
-                "envelope_meta": {
-                    k: v for k, v in env_safe.items() if k != "payload"
-                },
+                "envelope_meta": {k: v for k, v in env_safe.items() if k != "payload"},
                 "_meta": {
                     "errorAt": datetime.now(timezone.utc).isoformat(),
                     "job":     "job1-decrypt",
                 },
             }
-            log.warning("Decrypt error eventId=%s: %s", env_safe.get("eventId"), exc)
+            log.error("Decrypt pipeline error eventId=%s: %s", env_safe.get("eventId"), exc)
             yield DLQ_TAG, json.dumps(dlq, ensure_ascii=False)
 
 
