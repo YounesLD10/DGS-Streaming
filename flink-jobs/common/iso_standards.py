@@ -34,7 +34,7 @@ ISO8583_MTI = {
 }
 
 
-# ─── ISO 4217 Currency Codes (subset relevant to the dataset) ──────────────
+# ─── ISO 4217 Currency Codes (subset relevant to the dataset) ─────────────
 # numeric → (alpha, name, minor_units)
 ISO4217 = {
     "008": ("ALL", "Albanian Lek", 2),

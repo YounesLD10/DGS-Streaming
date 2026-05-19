@@ -18,16 +18,19 @@ import sys
 import time
 
 from pyflink.common import WatermarkStrategy, Types
-from pyflink.common.serialization import SimpleStringSchema
+from pyflink.common.serialization import SimpleStringSchema, Encoder
 from pyflink.datastream import StreamExecutionEnvironment, ProcessFunction, OutputTag
 from pyflink.datastream.connectors.kafka import (
     KafkaSource, KafkaSink, KafkaOffsetsInitializer, KafkaRecordSerializationSchema, DeliveryGuarantee,
 )
+from pyflink.datastream.connectors.file_system import FileSink, OutputFileConfig, RollingPolicy
 
 sys.path.insert(0, "/opt/jobs")
 from common.iso_standards import ISO8583_MTI, is_valid_currency, luhn_check  # noqa: E402
+from common.parquet_sink import ParquetWriterFn  # noqa: E402
 
 BOOTSTRAP = os.environ["KAFKA_BOOTSTRAP"]
+S3_BUCKET = os.environ.get("S3_BUCKET", "rt-payments")
 SOURCE_TOPIC = "payments.decrypted"
 VALID_TOPIC = "payments.validated"
 DLQ_TOPIC = "payments.dlq"
@@ -114,9 +117,24 @@ def main() -> None:
         .build()
     )
 
+    s3_sink = (
+        FileSink.for_row_format(f"s3a://{S3_BUCKET}/validated", Encoder.simple_string_encoder("UTF-8"))
+        .with_output_file_config(
+            OutputFileConfig.builder().with_part_prefix("validated").with_part_suffix(".jsonl").build()
+        )
+        .with_rolling_policy(RollingPolicy.default_rolling_policy(
+            part_size=64 * 1024 * 1024,
+            rollover_interval=60_000,
+            inactivity_interval=30_000,
+        ))
+        .build()
+    )
+
     src = env.from_source(source, WatermarkStrategy.no_watermarks(), "kafka-decrypted")
     main_stream = src.process(ValidateFn(), output_type=Types.STRING())
     main_stream.sink_to(_kafka_sink(VALID_TOPIC)).name("kafka-payments.validated")
+    main_stream.sink_to(s3_sink).name("minio-validated-jsonl")
+    main_stream.map(ParquetWriterFn(S3_BUCKET, "validated-parquet"), output_type=Types.STRING()).print()
     main_stream.get_side_output(DLQ_TAG).sink_to(_kafka_sink(DLQ_TOPIC)).name("kafka-dlq")
 
     env.execute("rt-payments-job2-validation")

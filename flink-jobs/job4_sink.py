@@ -8,14 +8,18 @@ The S3 endpoint is configured for MinIO via flink-conf.yaml in the image.
 """
 from __future__ import annotations
 import os
+import sys
 
-from pyflink.common import WatermarkStrategy
+from pyflink.common import WatermarkStrategy, Types
 from pyflink.common.serialization import SimpleStringSchema, Encoder
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitializer
 from pyflink.datastream.connectors.file_system import (
     FileSink, OutputFileConfig, RollingPolicy,
 )
+
+sys.path.insert(0, "/opt/jobs")
+from common.parquet_sink import ParquetWriterFn  # noqa: E402
 
 BOOTSTRAP = os.environ["KAFKA_BOOTSTRAP"]
 SOURCE_TOPIC = "payments.normalized"
@@ -61,11 +65,9 @@ def main() -> None:
         .build()
     )
 
-    (
-        env.from_source(source, WatermarkStrategy.no_watermarks(), "kafka-normalized")
-        .sink_to(sink)
-        .name("minio-rt-payments")
-    )
+    stream = env.from_source(source, WatermarkStrategy.no_watermarks(), "kafka-normalized")
+    stream.sink_to(sink).name("minio-canonical-jsonl")
+    stream.map(ParquetWriterFn(S3_BUCKET, "canonical-parquet"), output_type=Types.STRING()).print()
 
     env.execute("rt-payments-job4-sink")
 

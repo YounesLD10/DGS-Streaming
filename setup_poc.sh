@@ -789,7 +789,7 @@ cleanup_before_deploy() {
     done
   done
 
-    # ── Flink operator ───────────────────────────────────────────────────────
+    # ── Flink operator
   if helm status flink-kubernetes-operator -n "$FLINK_NAMESPACE" &>/dev/null; then
     warn "Release Helm 'flink-kubernetes-operator' déjà présente → désinstallation"
     helm uninstall flink-kubernetes-operator -n "$FLINK_NAMESPACE" --wait --timeout 120s || true

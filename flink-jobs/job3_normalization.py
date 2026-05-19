@@ -18,19 +18,22 @@ import sys
 import time
 
 from pyflink.common import WatermarkStrategy, Types
-from pyflink.common.serialization import SimpleStringSchema
+from pyflink.common.serialization import SimpleStringSchema, Encoder
 from pyflink.datastream import StreamExecutionEnvironment, MapFunction
 from pyflink.datastream.connectors.kafka import (
     KafkaSource, KafkaSink, KafkaOffsetsInitializer, KafkaRecordSerializationSchema, DeliveryGuarantee,
 )
+from pyflink.datastream.connectors.file_system import FileSink, OutputFileConfig, RollingPolicy
 
 sys.path.insert(0, "/opt/jobs")
+from common.parquet_sink import ParquetWriterFn  # noqa: E402
 from common.iso_standards import (  # noqa: E402
     ISO8583_MTI, currency_alpha, currency_minor_units, mcc_description,
     mask_pan, pan_bin, card_scheme, to_iso8601, business_date_from,
 )
 
 BOOTSTRAP = os.environ["KAFKA_BOOTSTRAP"]
+S3_BUCKET = os.environ.get("S3_BUCKET", "rt-payments")
 SOURCE_TOPIC = "payments.validated"
 SINK_TOPIC = "payments.normalized"
 GROUP_ID = "flink-job3-normalization"
@@ -153,12 +156,26 @@ def main() -> None:
         .build()
     )
 
-    (
+    s3_sink = (
+        FileSink.for_row_format(f"s3a://{S3_BUCKET}/normalized", Encoder.simple_string_encoder("UTF-8"))
+        .with_output_file_config(
+            OutputFileConfig.builder().with_part_prefix("normalized").with_part_suffix(".jsonl").build()
+        )
+        .with_rolling_policy(RollingPolicy.default_rolling_policy(
+            part_size=64 * 1024 * 1024,
+            rollover_interval=60_000,
+            inactivity_interval=30_000,
+        ))
+        .build()
+    )
+
+    normalized = (
         env.from_source(source, WatermarkStrategy.no_watermarks(), "kafka-validated")
         .map(NormalizeFn(), output_type=Types.STRING())
-        .sink_to(sink)
-        .name("kafka-payments.normalized")
     )
+    normalized.sink_to(sink).name("kafka-payments.normalized")
+    normalized.sink_to(s3_sink).name("minio-normalized-jsonl")
+    normalized.map(ParquetWriterFn(S3_BUCKET, "normalized-parquet"), output_type=Types.STRING()).print()
 
     env.execute("rt-payments-job3-normalization")
 
