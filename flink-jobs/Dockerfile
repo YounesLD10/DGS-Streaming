@@ -1,5 +1,5 @@
 # Custom PyFlink image: Flink 1.18 + Python + Kafka connector + S3/MinIO plugin
-# Built locally and loaded into minikube via `eval $(minikube docker-env)`.
+# Built locally and loaded into minikube via `eval $(minikube docker-env)`
 FROM flink:1.18-scala_2.12-java11
 
 ARG FLINK_VERSION=1.18.1
