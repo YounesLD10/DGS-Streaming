@@ -4,7 +4,6 @@ Consumes Debezium CDC events from `cdc.public.powercard_operations`,
 extracts INSERT/UPDATE rows, and emits pipeline envelopes to
 `payments.decrypted` — bypassing Fernet decryption since the data
 is already plaintext from PostgreSQL.
-
 Debezium envelope (schemas disabled — flat format):
   {"before": null, "after": {row_lowercase}, "op": "c"|"u"|"r"}
 Debezium envelope (schemas enabled — wrapped format):
