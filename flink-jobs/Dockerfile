@@ -54,6 +54,6 @@ RUN { \
 # ── Job code ──────────────────────────────────────────────────────────────
 WORKDIR /opt/jobs
 COPY common /opt/jobs/common
-COPY job1_decryption.py job2_validation.py job3_normalization.py job4_sink.py /opt/jobs/
+COPY job0_cdc_adapter.py job1_decryption.py job2_validation.py job3_normalization.py job4_sink.py /opt/jobs/
 
 USER flink
