@@ -14,7 +14,7 @@ step()    { echo -e "\n${CYAN}════════════════�
 
 # Configuration
 MINIKUBE_CPUS="${MINIKUBE_CPUS:-4}"
-MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-7168}"
+MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-9216}"
 MINIKUBE_DISK="${MINIKUBE_DISK:-30g}"
 MINIKUBE_DRIVER="${MINIKUBE_DRIVER:-docker}"
 MINIKUBE_K8S_VERSION="${MINIKUBE_K8S_VERSION:-v1.31.4}"
@@ -50,6 +50,15 @@ SCRIPTS_DIR="$(pwd)/scripts"
 JOBS_DIR="$(pwd)/flink-jobs"
 PRODUCER_DIR="$(pwd)/producer"
 FERNET_KEY_FILE="$(pwd)/.fernet.key"
+
+# CDC — PostgreSQL + Debezium Connect
+PG_NAMESPACE="$KAFKA_NAMESPACE"        # co-déployé dans ingestion pour simplifier
+PG_DB="${PG_DB:-powercard}"
+PG_USER="${PG_USER:-postgres}"
+PG_PASSWORD="${PG_PASSWORD:-postgres}"
+DEBEZIUM_USER="${DEBEZIUM_USER:-debezium}"
+DEBEZIUM_PASSWORD="${DEBEZIUM_PASSWORD:-debezium}"
+DEBEZIUM_CONNECT_IMAGE="${DEBEZIUM_CONNECT_IMAGE:-quay.io/debezium/connect:2.7.0.Final}"
 
 # Vérification des prérequis 
 check_prerequisites() {
@@ -291,7 +300,7 @@ resource "helm_release" "flink_operator" {
     value = "100m"
   }
 
-  timeout = 300
+  timeout = 900
   wait    = true
 }
 
@@ -402,7 +411,7 @@ resource "helm_release" "minio" {
   }
 
   cleanup_on_fail = true
-  timeout = 300
+  timeout = 600
   wait    = true
 }
 
@@ -649,9 +658,9 @@ resource "kubernetes_manifest" "flink_jobs" {
       flinkVersion    = "v1_18"
       serviceAccount  = "flink"
       flinkConfiguration = local.flink_conf
-      # JM 768m: metaspace(128)+overhead(77)=205 → Flink memory=563m ✓
+      # JM 640m: metaspace(128)+overhead(64)=192 → Flink memory=448m ✓
       # TM 640m: metaspace(128)+overhead(64)=192 → Flink memory=448m ✓
-      jobManager  = { resource = { memory = "768m", cpu = 0.25 }, replicas = 1 }
+      jobManager  = { resource = { memory = "640m", cpu = 0.25 }, replicas = 1 }
       taskManager = { resource = { memory = "640m", cpu = 0.5  }, replicas = 1 }
       podTemplate = {
         spec = {
@@ -885,6 +894,47 @@ apply_terraform_stage1() {
   success "Stage 1 appliqué"
 }
 
+_tf_import_if_missing_stage2() {
+  local S2="$TERRAFORM_DIR/stage2"
+  cd "$S2"
+
+  _imp() {
+    local res="$1" id="$2"
+    if ! terraform state list 2>/dev/null | grep -qF "$res"; then
+      warn "Import stage2 : $res"
+      terraform import -input=false "$res" "$id" 2>/dev/null || true
+    fi
+  }
+
+  # Fernet secrets
+  kubectl get secret fernet-key -n "$FLINK_NAMESPACE" &>/dev/null && \
+    _imp "kubernetes_secret.fernet_traitement" "$FLINK_NAMESPACE/fernet-key"
+  kubectl get secret fernet-key -n "$KAFKA_NAMESPACE" &>/dev/null && \
+    _imp "kubernetes_secret.fernet_ingestion"  "$KAFKA_NAMESPACE/fernet-key"
+
+  # Kafka cluster
+  kubectl get kafka "$KAFKA_CLUSTER_NAME" -n "$KAFKA_NAMESPACE" &>/dev/null && \
+    _imp "kubernetes_manifest.kafka_cluster" \
+         "apiVersion=kafka.strimzi.io/v1beta2,kind=Kafka,namespace=$KAFKA_NAMESPACE,name=$KAFKA_CLUSTER_NAME"
+
+  # KafkaTopics (resource name uses - not .)
+  for topic in payments payments.decrypted payments.validated payments.normalized payments.dlq; do
+    local rname="${topic//./-}"
+    kubectl get kafkatopic "$rname" -n "$KAFKA_NAMESPACE" &>/dev/null && \
+      _imp "kubernetes_manifest.pipeline_topics[\"$topic\"]" \
+           "apiVersion=kafka.strimzi.io/v1beta2,kind=KafkaTopic,namespace=$KAFKA_NAMESPACE,name=$rname"
+  done
+
+  # FlinkDeployments
+  for job in job1-decryption job2-validation job3-normalization job4-sink; do
+    kubectl get flinkdeployment "$job" -n "$FLINK_NAMESPACE" &>/dev/null && \
+      _imp "kubernetes_manifest.flink_jobs[\"$job\"]" \
+           "apiVersion=flink.apache.org/v1beta1,kind=FlinkDeployment,namespace=$FLINK_NAMESPACE,name=$job"
+  done
+
+  cd - > /dev/null
+}
+
 apply_terraform_stage2() {
   step "Terraform stage 2 : Kafka cluster + topics + Fernet + FlinkDeployments"
   ensure_fernet_key
@@ -892,6 +942,7 @@ apply_terraform_stage2() {
   local S2="$TERRAFORM_DIR/stage2"
   cd "$S2"
   terraform init -upgrade
+  _tf_import_if_missing_stage2
   terraform apply -auto-approve
   cd - > /dev/null
   unset TF_VAR_fernet_key
@@ -998,7 +1049,7 @@ wait_for_components() {
   log "Attente de MinIO…"
   kubectl rollout status deployment/minio \
     -n "$MINIO_NAMESPACE" \
-    --timeout=180s
+    --timeout=300s
 
   success "Kafka + MinIO opérationnels"
 }
@@ -1058,6 +1109,13 @@ teardown() {
   warn "Cette action va détruire TOUTE l'infrastructure."
   read -r -p "Confirmer la destruction ? (yes/no) : " confirm
   [[ "$confirm" == "yes" ]] || { log "Annulé."; exit 0; }
+
+  # 0. Nettoyage CDC (PostgreSQL + Debezium + job0) si déployés
+  log "Suppression des ressources CDC (si présentes)..."
+  kubectl delete flinkdeployment job0-cdc-adapter -n "$FLINK_NAMESPACE" --ignore-not-found 2>/dev/null || true
+  kubectl delete deployment postgresql debezium-connect -n "$PG_NAMESPACE" --ignore-not-found 2>/dev/null || true
+  kubectl delete service postgresql debezium-connect -n "$PG_NAMESPACE" --ignore-not-found 2>/dev/null || true
+  kubectl delete configmap postgresql-init -n "$PG_NAMESPACE" --ignore-not-found 2>/dev/null || true
 
   # 1. Désinstaller les Helm releases explicitement (Terraform peut échouer
   #    si des CRDs/RoleBindings sont déjà dans un état incohérent)
@@ -1151,6 +1209,494 @@ teardown() {
   success "Infrastructure détruite et Minikube arrêté — prêt pour un nouveau 'up'"
 }
 
+# ── Attend que l'API REST Debezium soit prête et enregistre le connecteur ──
+register_debezium_connector() {
+  log "Attente du pod Debezium Connect (max 120s)..."
+  local pod elapsed=0
+  until pod=$(kubectl get pod -n "$PG_NAMESPACE" -l app=debezium-connect \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) && [[ -n "$pod" ]]; do
+    sleep 4; (( elapsed += 4 ))
+    (( elapsed >= 120 )) && error "Timeout : pod Debezium Connect introuvable"
+  done
+
+  log "Attente de l'API REST Debezium sur :8083 (max 180s)..."
+  elapsed=0
+  until kubectl exec -n "$PG_NAMESPACE" "$pod" -- \
+        curl -sf http://localhost:8083/connectors &>/dev/null; do
+    sleep 5; (( elapsed += 5 ))
+    (( elapsed >= 180 )) && error "Timeout : API REST Debezium non disponible"
+  done
+  success "API REST Debezium disponible"
+
+  # Create the replication publication as the postgres superuser BEFORE registering
+  # the connector. The debezium user has REPLICATION LOGIN but not CREATE on the
+  # database, so Debezium cannot auto-create it with publication.autocreate.mode=filtered.
+  log "Création de la publication de réplication (en tant que superuser postgres)..."
+  kubectl exec -n "$PG_NAMESPACE" deployment/postgresql -- \
+    psql -U "$PG_USER" -d "$PG_DB" -c \
+    "CREATE PUBLICATION dbz_publication FOR TABLE public.powercard_operations;" \
+    2>/dev/null || warn "Publication déjà existante — OK"
+
+  log "Enregistrement du connecteur powercard-connector..."
+  local pg_host="postgresql.${PG_NAMESPACE}.svc.cluster.local"
+  kubectl exec -n "$PG_NAMESPACE" "$pod" -- \
+    curl -sf -X POST http://localhost:8083/connectors \
+      -H 'Content-Type: application/json' \
+      -d "{
+        \"name\": \"powercard-connector\",
+        \"config\": {
+          \"connector.class\": \"io.debezium.connector.postgresql.PostgresConnector\",
+          \"tasks.max\": \"1\",
+          \"database.hostname\": \"${pg_host}\",
+          \"database.port\": \"5432\",
+          \"database.user\": \"${DEBEZIUM_USER}\",
+          \"database.password\": \"${DEBEZIUM_PASSWORD}\",
+          \"database.dbname\": \"${PG_DB}\",
+          \"topic.prefix\": \"cdc\",
+          \"table.include.list\": \"public.powercard_operations\",
+          \"plugin.name\": \"pgoutput\",
+          \"slot.name\": \"debezium_slot\",
+          \"publication.name\": \"dbz_publication\",
+          \"publication.autocreate.mode\": \"disabled\",
+          \"decimal.handling.mode\": \"string\",
+          \"time.precision.mode\": \"adaptive\"
+        }
+      }" 2>/dev/null && success "Connecteur enregistré" || \
+    warn "Connecteur déjà existant ou erreur d'enregistrement — vérifier l'état manuellement"
+}
+
+# ── Déploie PostgreSQL + Debezium Connect + Job 0 CDC Adapter ─────────────
+apply_cdc() {
+  step "Déploiement CDC : PostgreSQL + Debezium Connect + Job 0"
+
+  local bootstrap="${KAFKA_CLUSTER_NAME}-kafka-bootstrap.${KAFKA_NAMESPACE}.svc:9092"
+
+  # ── 1. ConfigMap init SQL PostgreSQL ────────────────────────────────────
+  log "Création du ConfigMap postgresql-init..."
+  kubectl apply -n "$PG_NAMESPACE" -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgresql-init
+  namespace: ${PG_NAMESPACE}
+data:
+  01-schema.sql: |
+    CREATE TABLE IF NOT EXISTS public.powercard_operations (
+        id                              BIGSERIAL PRIMARY KEY,
+        message_type                    TEXT,
+        function_code                   TEXT,
+        processing_code                 TEXT,
+        action_code                     TEXT,
+        original_action_code            TEXT,
+        issuer_action_code              TEXT,
+        event_code                      TEXT,
+        network_code                    TEXT,
+        issuing_bank                    TEXT,
+        transaction_local_date          TEXT,
+        transmission_date_and_time      TEXT,
+        response_date_and_time          TEXT,
+        internal_transmission_time      TEXT,
+        capture_date                    TEXT,
+        business_date                   TEXT,
+        product_code                    TEXT,
+        card_type                       TEXT,
+        transaction_amount              TEXT,
+        cash_back_amount                TEXT,
+        transaction_currency            TEXT,
+        replacement_amount              TEXT,
+        billing_amount                  TEXT,
+        billing_currency                TEXT,
+        conversion_rate                 TEXT,
+        conversion_rate_date            TEXT,
+        iss_settlement_amount           TEXT,
+        iss_settlement_currency         TEXT,
+        iss_settlement_date             TEXT,
+        iss_conv_rate_settlement        TEXT,
+        iss_conv_rate_settlement_date   TEXT,
+        acq_settlement_amount           TEXT,
+        acq_settlement_currency         TEXT,
+        acq_settlement_date             TEXT,
+        acq_conv_rate_settlement        TEXT,
+        acq_conv_rate_settlement_date   TEXT,
+        services_setup_code             TEXT,
+        receiving_institution           TEXT,
+        acquirer_institution_code       TEXT,
+        acquirer_bank                   TEXT,
+        card_acceptor_activity          TEXT,
+        tcc                             TEXT,
+        card_acceptor_term_id           TEXT,
+        card_acceptor_id                TEXT,
+        card_acc_name_address           TEXT,
+        pos_entry_mode                  TEXT,
+        pos_condition_code              TEXT,
+        pos_data                        TEXT,
+        forwarding_country_code         TEXT,
+        forwarding_institution_code     TEXT,
+        forwarding_bank                 TEXT,
+        authorization_length            TEXT,
+        authorization_code              TEXT,
+        original_authorization_code     TEXT,
+        authorization_source            TEXT,
+        security_verif_level            TEXT,
+        security_verif_result           TEXT,
+        reject_code                     TEXT,
+        reject_reason                   TEXT,
+        reason_code                     TEXT,
+        origine_code                    TEXT,
+        original_transaction_date_time  TEXT,
+        reversal_stan                   TEXT,
+        reversal_transaction_date       TEXT,
+        autho_flag                      TEXT,
+        reversal_flag                   TEXT,
+        transaction_flag                TEXT,
+        matching_status                 TEXT,
+        matching_date                   TEXT,
+        matching_level                  TEXT,
+        matching_date_purge             TEXT,
+        private_tlv_data                TEXT,
+        authorization_id                TEXT,
+        transaction_id                  TEXT,
+        user_create                     TEXT,
+        date_create                     TEXT,
+        user_modif                      TEXT,
+        date_modif                      TEXT,
+        internal_stan                   TEXT,
+        external_stan                   TEXT,
+        reference_number                TEXT,
+        routing_code                    TEXT,
+        capture_code                    TEXT,
+        acquirer_resource_code          TEXT,
+        acquiring_country_code          TEXT,
+        card_number                     TEXT,
+        card_sequence_number            TEXT,
+        chip_cryptogram_info_data       TEXT,
+        destination_account_code        TEXT,
+        destination_account_entity_cod  TEXT,
+        destination_account_entity_id   TEXT,
+        destination_account_number      TEXT,
+        destination_account_type        TEXT,
+        end_expiry_date                 TEXT,
+        external_cvv_result_code        TEXT,
+        issuer_resource_code            TEXT,
+        limit_id                        TEXT,
+        limit_index                     TEXT,
+        network_data                    TEXT,
+        network_id                      TEXT,
+        original_table_indicator        TEXT,
+        service_code                    TEXT,
+        source_account_code             TEXT,
+        source_account_entity_code      TEXT,
+        source_account_entity_id        TEXT,
+        source_account_number           TEXT,
+        source_account_type             TEXT,
+        start_expiry_date               TEXT,
+        current_table_indicator         TEXT,
+        ingested_at                     TIMESTAMPTZ DEFAULT NOW()
+    );
+    ALTER TABLE public.powercard_operations REPLICA IDENTITY FULL;
+  02-debezium-user.sql: |
+    DO \$\$ BEGIN
+      CREATE USER ${DEBEZIUM_USER} WITH REPLICATION LOGIN PASSWORD '${DEBEZIUM_PASSWORD}';
+    EXCEPTION WHEN duplicate_object THEN RAISE NOTICE 'User ${DEBEZIUM_USER} already exists'; END \$\$;
+    GRANT CONNECT ON DATABASE ${PG_DB} TO ${DEBEZIUM_USER};
+    GRANT USAGE ON SCHEMA public TO ${DEBEZIUM_USER};
+    GRANT SELECT ON public.powercard_operations TO ${DEBEZIUM_USER};
+EOF
+
+  # ── 2. PostgreSQL Deployment + Service ──────────────────────────────────
+  log "Déploiement PostgreSQL..."
+  kubectl apply -n "$PG_NAMESPACE" -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgresql
+  namespace: ${PG_NAMESPACE}
+  labels:
+    app: postgresql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+    spec:
+      containers:
+      - name: postgresql
+        image: postgres:15
+        args: ["-c", "wal_level=logical", "-c", "max_replication_slots=4",
+               "-c", "max_wal_senders=4"]
+        env:
+        - name: POSTGRES_DB
+          value: "${PG_DB}"
+        - name: POSTGRES_USER
+          value: "${PG_USER}"
+        - name: POSTGRES_PASSWORD
+          value: "${PG_PASSWORD}"
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: init-sql
+          mountPath: /docker-entrypoint-initdb.d
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "300m"
+      volumes:
+      - name: init-sql
+        configMap:
+          name: postgresql-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: ${PG_NAMESPACE}
+spec:
+  selector:
+    app: postgresql
+  ports:
+  - port: 5432
+    targetPort: 5432
+EOF
+
+  # ── 3. Debezium Connect Deployment + Service ────────────────────────────
+  log "Déploiement Debezium Connect (${DEBEZIUM_CONNECT_IMAGE})..."
+  kubectl apply -n "$PG_NAMESPACE" -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: debezium-connect
+  namespace: ${PG_NAMESPACE}
+  labels:
+    app: debezium-connect
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: debezium-connect
+  template:
+    metadata:
+      labels:
+        app: debezium-connect
+    spec:
+      containers:
+      - name: debezium-connect
+        image: ${DEBEZIUM_CONNECT_IMAGE}
+        env:
+        - name: BOOTSTRAP_SERVERS
+          value: "${bootstrap}"
+        - name: GROUP_ID
+          value: "debezium-connect-1"
+        - name: CONFIG_STORAGE_TOPIC
+          value: "debezium_connect_configs"
+        - name: OFFSET_STORAGE_TOPIC
+          value: "debezium_connect_offsets"
+        - name: STATUS_STORAGE_TOPIC
+          value: "debezium_connect_statuses"
+        - name: CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE
+          value: "false"
+        - name: CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE
+          value: "false"
+        ports:
+        - containerPort: 8083
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: debezium-connect
+  namespace: ${PG_NAMESPACE}
+spec:
+  selector:
+    app: debezium-connect
+  ports:
+  - port: 8083
+    targetPort: 8083
+EOF
+
+  # ── 4. Attente PostgreSQL + Debezium ────────────────────────────────────
+  log "Attente PostgreSQL (rollout)..."
+  kubectl rollout status deployment/postgresql -n "$PG_NAMESPACE" --timeout=120s
+
+  log "Attente Debezium Connect (rollout)..."
+  kubectl rollout status deployment/debezium-connect -n "$PG_NAMESPACE" --timeout=300s
+
+  # ── 5. Enregistrement du connecteur ─────────────────────────────────────
+  register_debezium_connector
+
+  # ── 6. Rebuild image (job0 ajouté) + FlinkDeployment job0 ───────────────
+  build_jobs_image
+
+  log "Déploiement FlinkDeployment job0-cdc-adapter..."
+  kubectl apply -n "$FLINK_NAMESPACE" -f - <<EOF
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: job0-cdc-adapter
+  namespace: ${FLINK_NAMESPACE}
+  labels:
+    app.kubernetes.io/part-of: rt-payments
+    app.kubernetes.io/component: job0-cdc-adapter
+spec:
+  image: ${JOBS_IMAGE}
+  imagePullPolicy: Never
+  flinkVersion: v1_18
+  serviceAccount: flink
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "1"
+    state.backend: hashmap
+    state.checkpoints.dir: "file:///tmp/flink-checkpoints"
+    jobmanager.memory.jvm-metaspace.size: "128mb"
+    jobmanager.memory.jvm-overhead.min: "64mb"
+    taskmanager.memory.jvm-metaspace.size: "128mb"
+    taskmanager.memory.jvm-overhead.min: "64mb"
+    taskmanager.memory.managed.fraction: "0.2"
+    s3.endpoint: "http://minio.${MINIO_NAMESPACE}.svc:9000"
+    s3.path.style.access: "true"
+    s3.access-key: "${MINIO_ACCESS_KEY}"
+    s3.secret-key: "${MINIO_SECRET_KEY}"
+  jobManager:
+    resource:
+      memory: "640m"
+      cpu: 0.25
+    replicas: 1
+  taskManager:
+    resource:
+      memory: "640m"
+      cpu: 0.25
+    replicas: 1
+  podTemplate:
+    spec:
+      containers:
+      - name: flink-main-container
+        env:
+        - name: KAFKA_BOOTSTRAP
+          value: "${bootstrap}"
+        - name: S3_BUCKET
+          value: "${MINIO_BUCKET}"
+  job:
+    jarURI: "local:///opt/flink/python-driver/flink-python.jar"
+    entryClass: "org.apache.flink.client.python.PythonDriver"
+    args: ["-pyclientexec", "/usr/bin/python3", "-py", "/opt/jobs/job0_cdc_adapter.py"]
+    parallelism: 1
+    upgradeMode: stateless
+EOF
+
+  success "CDC déployé ✓"
+  echo -e """
+${CYAN}Insérer une ligne de test dans PostgreSQL :${NC}
+  kubectl exec -n ${PG_NAMESPACE} deployment/postgresql -- \\
+    psql -U ${PG_USER} -d ${PG_DB} -c \\
+    \"INSERT INTO powercard_operations (message_type, transaction_currency, transaction_amount, card_number) \\
+      VALUES ('1100', '504', '100', '5321962100025057')\"
+
+${CYAN}Vérifier le statut du connecteur Debezium :${NC}
+  kubectl port-forward svc/debezium-connect -n ${PG_NAMESPACE} 8083:8083 &
+  curl -s http://localhost:8083/connectors/powercard-connector/status | python3 -m json.tool
+
+${CYAN}Flink UI Job 0 :${NC}
+  kubectl port-forward svc/job0-cdc-adapter-rest -n ${FLINK_NAMESPACE} 8080:8081
+  # → http://localhost:8080
+"""
+}
+
+# ── Load a Powercard CSV directly into PostgreSQL (triggers CDC → pipeline) ──
+load_csv() {
+  local csv="${1:-}"
+  [[ -z "$csv" ]] && error "Usage : $0 load-csv <chemin/vers/data.csv>"
+  [[ ! -f "$csv" ]] && error "Fichier introuvable : $csv"
+
+  step "Chargement CSV → PostgreSQL (CDC)"
+
+  # Find the PostgreSQL pod
+  local pg_pod
+  pg_pod=$(kubectl get pod -n "$PG_NAMESPACE" -l app=postgresql \
+           -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  [[ -z "$pg_pod" ]] && error "Pod PostgreSQL introuvable — lancer './setup_poc.sh cdc' d'abord"
+
+  log "Pod PostgreSQL : $pg_pod"
+  log "Copie du fichier CSV dans le pod..."
+  kubectl cp "$csv" "$PG_NAMESPACE/$pg_pod:/tmp/powercard_data.csv"
+
+  log "Chargement via COPY (bulk insert → Debezium capturera les lignes)..."
+  kubectl exec -n "$PG_NAMESPACE" "$pg_pod" -- \
+    psql -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 -c "
+COPY public.powercard_operations (
+  message_type, function_code, processing_code, action_code, original_action_code,
+  issuer_action_code, event_code, network_code, issuing_bank, transaction_local_date,
+  transmission_date_and_time, response_date_and_time, internal_transmission_time,
+  capture_date, business_date, product_code, card_type, transaction_amount,
+  cash_back_amount, transaction_currency, replacement_amount, billing_amount,
+  billing_currency, conversion_rate, conversion_rate_date, iss_settlement_amount,
+  iss_settlement_currency, iss_settlement_date, iss_conv_rate_settlement,
+  iss_conv_rate_settlement_date, acq_settlement_amount, acq_settlement_currency,
+  acq_settlement_date, acq_conv_rate_settlement, acq_conv_rate_settlement_date,
+  services_setup_code, receiving_institution, acquirer_institution_code,
+  acquirer_bank, card_acceptor_activity, tcc, card_acceptor_term_id,
+  card_acceptor_id, card_acc_name_address, pos_entry_mode, pos_condition_code,
+  pos_data, forwarding_country_code, forwarding_institution_code, forwarding_bank,
+  authorization_length, authorization_code, original_authorization_code,
+  authorization_source, security_verif_level, security_verif_result, reject_code,
+  reject_reason, reason_code, origine_code, original_transaction_date_time,
+  reversal_stan, reversal_transaction_date, autho_flag, reversal_flag,
+  transaction_flag, matching_status, matching_date, matching_level,
+  matching_date_purge, private_tlv_data, authorization_id, transaction_id,
+  user_create, date_create, user_modif, date_modif, internal_stan, external_stan,
+  reference_number, routing_code, capture_code, acquirer_resource_code,
+  acquiring_country_code, card_number, card_sequence_number,
+  chip_cryptogram_info_data, destination_account_code,
+  destination_account_entity_cod, destination_account_entity_id,
+  destination_account_number, destination_account_type, end_expiry_date,
+  external_cvv_result_code, issuer_resource_code, limit_id, limit_index,
+  network_data, network_id, original_table_indicator, service_code,
+  source_account_code, source_account_entity_code, source_account_entity_id,
+  source_account_number, source_account_type, start_expiry_date,
+  current_table_indicator
+)
+FROM '/tmp/powercard_data.csv'
+WITH (FORMAT CSV, HEADER true, NULL '');
+"
+
+  local row_count
+  row_count=$(kubectl exec -n "$PG_NAMESPACE" "$pg_pod" -- \
+    psql -U "$PG_USER" -d "$PG_DB" -tAc "SELECT COUNT(*) FROM public.powercard_operations;")
+  success "Import terminé — ${row_count} lignes dans powercard_operations"
+  echo -e """
+${CYAN}Suivi du pipeline CDC :${NC}
+  # Consommer le topic Debezium (messages bruts CDC) :
+  kubectl exec -n ${KAFKA_NAMESPACE} -it ${KAFKA_CLUSTER_NAME}-kafka-0 -- \\
+    bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \\
+    --topic cdc.public.powercard_operations --from-beginning --max-messages 3
+
+  # Vérifier payments.decrypted (sortie job0) :
+  kubectl exec -n ${KAFKA_NAMESPACE} -it ${KAFKA_CLUSTER_NAME}-kafka-0 -- \\
+    bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \\
+    --topic payments.decrypted --from-beginning --max-messages 3
+
+  # Vérifier payments.normalized (sortie job3) :
+  kubectl exec -n ${KAFKA_NAMESPACE} -it ${KAFKA_CLUSTER_NAME}-kafka-0 -- \\
+    bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \\
+    --topic payments.normalized --from-beginning --max-messages 3
+
+  # Vérifier les fichiers Parquet dans MinIO :
+  kubectl port-forward -n ${MINIO_NAMESPACE} svc/minio-console 9001:9001
+  # → http://localhost:9001  ($MINIO_ACCESS_KEY / $MINIO_SECRET_KEY)
+  # Bucket : ${MINIO_BUCKET}/canonical/
+"""
+}
+
 #  Point d'entrée
 usage() {
   echo -e """
@@ -1159,9 +1705,14 @@ Usage : $0 [COMMANDE]
   up                    Infrastructure complète (Minikube + opérateurs + jobs)
   build                 Construire l'image PyFlink dans le docker daemon de minikube
   jobs                  Réappliquer uniquement les 4 FlinkDeployments (stage2)
+  cdc                   (Re)déployer PostgreSQL + Debezium + Job 0 (CDC pipeline)
+                        Inclus automatiquement dans 'up' — utile pour redéployer seul
+  load-csv <csv>        Charger un CSV Powercard dans PostgreSQL
+                        Debezium capturera les INSERT → pipeline CDC complet
+                        Prérequis : ./setup_poc.sh cdc déjà exécuté
   produce <csv> [rate] [limit]
                         Lancer le producer en local vers le NodePort Kafka
-  down                  Détruire toute l'infrastructure
+  down                  Détruire toute l'infrastructure (inclut les ressources CDC)
   plan                  Plan Terraform (partiel — sans CRDs)
   status                Statut des pods dans les 3 namespaces
   help                  Afficher cette aide
@@ -1187,6 +1738,7 @@ main() {
       apply_terraform_stage2     # Kafka cluster + topics + Fernet + 4 FlinkDeployments
       wait_for_components        # Kafka cluster Ready + MinIO rollout
       wait_for_jobs              # 4 FlinkDeployments STABLE
+      apply_cdc                  # PostgreSQL + Debezium + job0 CDC adapter
       print_summary
       ;;
     build)
@@ -1218,13 +1770,35 @@ main() {
         -target=helm_release.flink_operator \
         -target=helm_release.minio
       ;;
+    cdc)
+      apply_cdc
+      ;;
+    load-csv)
+      shift
+      load_csv "$@"
+      ;;
     status)
-      echo -e "\n${CYAN}=== ingestion  (Kafka / Strimzi) — namespace: $KAFKA_NAMESPACE ===${NC}"
+      echo -e "\n${CYAN}=== Pods — ingestion (Kafka / Strimzi / PostgreSQL / Debezium) ===${NC}"
       kubectl get pods -n "$KAFKA_NAMESPACE" -o wide
-      echo -e "\n${CYAN}=== traitement (Apache Flink)    — namespace: $FLINK_NAMESPACE ===${NC}"
+      echo -e "\n${CYAN}=== Pods — traitement (Apache Flink) ===${NC}"
       kubectl get pods -n "$FLINK_NAMESPACE" -o wide
-      echo -e "\n${CYAN}=== stockage   (MinIO)           — namespace: $MINIO_NAMESPACE ===${NC}"
+      kubectl get flinkdeployment -n "$FLINK_NAMESPACE"
+      echo -e "\n${CYAN}=== Pods — stockage (MinIO) ===${NC}"
       kubectl get pods -n "$MINIO_NAMESPACE" -o wide
+
+      echo -e "\n${CYAN}=== Pipeline — message counts per Kafka topic ===${NC}"
+      for topic in cdc.public.powercard_operations payments.decrypted payments.validated payments.normalized payments.dlq; do
+        count=$(kubectl exec -n "$KAFKA_NAMESPACE" "${KAFKA_CLUSTER_NAME}-kafka-0" -- \
+          bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic "$topic" \
+          2>/dev/null | awk -F: '{sum+=$3} END {print sum+0}')
+        printf "  %-45s %s messages\n" "$topic" "$count"
+      done
+
+      echo -e "\n${CYAN}=== MinIO — objets dans rt-payments ===${NC}"
+      kubectl exec -n "$MINIO_NAMESPACE" deployment/minio -- \
+        sh -c "mc alias set local http://localhost:9000 $MINIO_ACCESS_KEY $MINIO_SECRET_KEY >/dev/null 2>&1; \
+               mc du --recursive local/$MINIO_BUCKET/ 2>/dev/null || \
+               mc ls --recursive local/$MINIO_BUCKET/ 2>/dev/null | head -20"
       ;;
     help|--help|-h)
       usage
