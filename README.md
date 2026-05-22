@@ -1,6 +1,6 @@
 # DGS-Streaming — Traitement Temps Réel des Paiements
 
-> **Proof of Concept** — Pipeline de traitement en temps réel des transactions de paiement,
+> Pipeline de traitement en temps réel des transactions de paiement,
 > déployé sur Minikube pour SWAM
 
 ---
