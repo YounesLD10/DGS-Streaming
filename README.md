@@ -1,7 +1,7 @@
-# DGS-Streaming — Infrastructure Temps Réel des Données Bancaires
+# DGS-Streaming — Traitement Temps Réel des Paiements
 
-> **Proof of Concept** — Pipeline de traitement en temps réel des transactions bancaires,
-> déployé sur Minikube avec Terraform 
+> **Proof of Concept** — Pipeline de traitement en temps réel des transactions de paiement,
+> déployé sur Minikube pour SWAM
 
 ---
 
@@ -12,36 +12,49 @@
 3. [Prérequis](#3-prérequis)
 4. [Structure du projet](#4-structure-du-projet)
 5. [Composants déployés](#5-composants-déployés)
-6. [Déploiement](#6-déploiement)
-7. [Vérification de l'état du cluster](#7-vérification-de-létat-du-cluster)
-8. [Sécurité réseau et RBAC](#8-sécurité-réseau-et-rbac)
-9. [Dépannage — Problèmes rencontrés](#9-dépannage--problèmes-rencontrés)
-10. [Suppression de l'infrastructure](#10-suppression-de-linfrastructure)
+6. [Les jobs Flink — Détail complet](#6-les-jobs-flink--détail-complet)
+7. [Déploiement](#7-déploiement)
+8. [Vérification de l'état du cluster](#8-vérification-de-létat-du-cluster)
+9. [Exécution du producteur](#9-exécution-du-producteur)
+10. [Sécurité réseau et RBAC](#10-sécurité-réseau-et-rbac)
+11. [Dépannage — Problèmes rencontrés](#11-dépannage--problèmes-rencontrés)
+12. [Suppression de l'infrastructure](#12-suppression-de-linfrastructure)
 
 ---
 
 ## 1. Vue d'ensemble
 
-Ce PoC démontre un pipeline de streaming temps réel pour le traitement des transactions bancaires. Les données de transactions (fichier CSV `Operations_card`) sont ingérées via **Apache Kafka**, traitées par **Apache Flink**, et stockées dans **MinIO**. L'infrastructure complète est provisionnée via **Terraform** sur un cluster Kubernetes local **Minikube**, en mode KRaft (sans Zookeeper).
+Ce PoC démontre un pipeline de streaming temps réel pour le traitement des transactions de paiement bancaire issues du système **Powercard**. Il lit un fichier CSV d'opérations cartes, chiffre les données avec **Fernet (AES-128-CBC + HMAC-SHA256)**, les publie vers Apache Kafka, puis les fait transiter par 4 jobs PyFlink successifs avant de les stocker dans MinIO (S3-compatible). L'infrastructure complète est provisionnée via **Terraform** sur un cluster Kubernetes local **Minikube**.
 
 ```
-Données CSV Bancaires
+Fichier CSV Powercard Operations
         │
         ▼
-Producer ──► Apache Kafka ──► Apache Flink ──► MinIO (S3)
-             (KRaft mode)    (JM + TM)        (stockage objet)
+ producer.py (Python)
+ ├─ Chiffrement Fernet de chaque ligne
+ └─► Topic Kafka: payments
+                    │
+             job1_decryption.py      → payments.decrypted  (ou payments.dlq)
+                    │
+             job2_validation.py      → payments.validated   (ou payments.dlq)
+                    │
+             job3_normalization.py   → payments.normalized
+                    │
+             job4_sink.py            → MinIO s3a://rt-payments/canonical/
 ```
 
 **Stack technique :**
 
 | Composant | Technologie | Version |
 |-----------|-------------|---------|
-| Orchestration K8s | Minikube | ≥ 1.28 |
-| Infrastructure as Code | Terraform | ≥ 1.6 |
-| Message broker | Apache Kafka | 3.8.0 |
+| Orchestration K8s | Minikube | ≥ 1.30 |
+| Infrastructure as Code | Terraform | ≥ 1.0 |
+| Message broker | Apache Kafka (Strimzi) | 3.8.0 |
+| Opérateur Kafka | Strimzi | 0.43.0 |
 | Moteur de traitement | Apache Flink | 1.18.1 |
-| Stockage objet | MinIO | latest |
-| Driver Minikube | Docker | ≥ 24.0 |
+| Opérateur Flink | Flink Kubernetes Operator | 1.10.0 |
+| Stockage objet | MinIO | Standalone (Helm 5.4.0) |
+| Producteur | Python | 3.12 |
 
 ---
 
@@ -50,77 +63,108 @@ Producer ──► Apache Kafka ──► Apache Flink ──► MinIO (S3)
 ### Diagramme de flux de données
 
 ```mermaid
-flowchart LR
-    subgraph Local["Machine locale (WSL2)"]
-        CSV["📄 Operations_card.csv\nDonnées bancaires"]
-        PROD["🐍 Producer\nTransactions bancaires"]
+flowchart TD
+
+    subgraph LOCAL["Machine locale (WSL2 / Linux)"]
+
+        CSV["CSV Powercard Operations"]
+
+        PRODUCER["producer.py
+        Python Producer"]
+
+        ENCRYPT["Fernet Encryption
+        AES-128-CBC + HMAC-SHA256"]
+
+        CSV --> PRODUCER
+        PRODUCER --> ENCRYPT
     end
 
-    subgraph K8s["Minikube Cluster (2 CPUs / 3072MB)"]
-        subgraph NS_KAFKA["namespace: kafka"]
-            BROKER["📦 kafka-deployment\napache/kafka:3.8.0\nKRaft mode"]
+    subgraph K8S["Minikube Kubernetes Cluster"]
+
+        subgraph ING["Namespace: ingestion"]
+
+            STRIMZI["Strimzi Operator"]
+
+            KAFKA["Apache Kafka 3.8.0
+            1 Broker + ZooKeeper"]
+
+            TOPICS["Topics
+            • payments
+            • payments.decrypted
+            • payments.validated
+            • payments.normalized
+            • payments.dlq"]
+
+            STRIMZI --> KAFKA
+            KAFKA --> TOPICS
         end
 
-        subgraph NS_FLINK["namespace: flink"]
-            JM["🖥️ flink-jobmanager\napache/flink:1.18.1"]
-            TM["⚙️ flink-taskmanager\napache/flink:1.18.1"]
+        subgraph FLINK["Namespace: traitement"]
+
+            FLINKOP["Flink Kubernetes Operator"]
+
+            JOB1["Job 1
+            Decryption"]
+
+            JOB2["Job 2
+            Validation"]
+
+            JOB3["Job 3
+            Normalization"]
+
+            JOB4["Job 4
+            Sink to MinIO"]
+
+            FLINKOP --> JOB1
+            FLINKOP --> JOB2
+            FLINKOP --> JOB3
+            FLINKOP --> JOB4
         end
 
-        subgraph NS_MINIO["namespace: minio"]
-            MINIO["🗄️ MinIO Standalone\nminio/minio:latest\nport: 9000 / 9001"]
+        subgraph STORAGE["Namespace: stockage"]
+
+            MINIO["MinIO S3 Storage
+            Bucket: rt-payments/canonical"]
         end
     end
 
-    CSV --> PROD
-    PROD -->|"port 9092"| BROKER
-    BROKER -->|"9092 (interne)"| JM
-    JM <--> TM
-    TM -->|"9000 (interne)"| MINIO
+    ENCRYPT -->|"Kafka Producer"| KAFKA
+
+    KAFKA -->|"payments"| JOB1
+    JOB1 -->|"payments.decrypted"| JOB2
+    JOB2 -->|"payments.validated"| JOB3
+    JOB3 -->|"payments.normalized"| JOB4
+    JOB4 -->|"JSONL via S3A"| MINIO
+
+    JOB1 -.->|"errors"| DLQ["payments.dlq"]
+    JOB2 -.->|"validation errors"| DLQ
 ```
 
-### Diagramme d'infrastructure Terraform
+### Terraform — Deux étapes de déploiement
 
-```mermaid
-graph TD
-    TF_MAIN["main.tf\nmodule: kafka_infrastructure"]
+Le déploiement est divisé en deux étapes pour éviter les conflits de CRDs Kubernetes :
 
-    TF_NS["namespaces.tf\nkafka / flink / minio"]
+```
+terraform/          (Stage 1 — Opérateurs)
+├── namespaces.tf   → 3 namespaces (ingestion, traitement, stockage)
+├── kafka.tf        → Strimzi operator + attente CRD
+├── flink.tf        → Flink Kubernetes Operator + attente CRD
+└── minio.tf        → MinIO via Helm
 
-    TF_KAFKA["modules/kafka/\ndeployment.tf\nservice.tf\nnetwork_policies.tf\nrbac.tf"]
-
-    TF_MINIO["minio.tf\nkubernetes_deployment_v1\nkubernetes_service_v1"]
-
-    TF_FLINK["flink.tf\nflink-jobmanager\nflink-taskmanager\nflink-jobmanager-service"]
-
-    TF_MAIN --> TF_NS
-    TF_NS --> TF_KAFKA
-    TF_NS --> TF_MINIO
-    TF_NS --> TF_FLINK
+terraform/stage2/   (Stage 2 — Ressources CRD)
+├── kafka-crd.tf    → KafkaCluster + 5 KafkaTopics
+└── flink-crd.tf    → 4 FlinkDeployments + Secrets Fernet
 ```
 
-### Diagramme de sécurité réseau
+Le Stage 2 ne peut s'exécuter qu'après le Stage 1 car les CRDs doivent exister.
+**Les fichiers `.tf` sont générés dynamiquement** par `setup_poc.sh` depuis des heredocs intégrés — ils ne sont pas versionnés. Pour modifier la configuration Terraform, éditer les heredocs dans `setup_poc.sh`.
 
-```mermaid
-flowchart TB
-    subgraph flink_ns["namespace: flink"]
-        JM2["flink-jobmanager"]
-        TM2["flink-taskmanager"]
-    end
+### Mode application Flink (pas mode session)
 
-    subgraph kafka_ns["namespace: kafka"]
-        KB["Kafka broker\n:9092"]
-    end
-
-    subgraph minio_ns["namespace: minio"]
-        MN["MinIO\n:9000"]
-    end
-
-    JM2 -->|"✅ allow-flink-to-kafka\n(port 9092)"| KB
-    TM2 -->|"✅ allow-flink-to-minio\n(port 9000)"| MN
-    X1["❌ Tout autre trafic\nbloqué par défaut\n(default-deny-all)"] -.-> kafka_ns
-    X1 -.-> flink_ns
-    X1 -.-> minio_ns
-```
+Chaque job tourne en **mode application** (`FlinkDeployment` avec une section `job`), ce qui signifie :
+- Chaque job dispose de son propre pod JobManager et donc de sa propre interface REST.
+- Le jar est référencé en `local://` — ce schéma fonctionne en mode application car le JM lit depuis son propre système de fichiers de conteneur.
+- Le jar Python est un **lien symbolique** vers l'original (les deux chemins doivent coexister).
 
 ---
 
@@ -128,323 +172,578 @@ flowchart TB
 
 ### Outils requis
 
-| Outil | Version minimale | Installation |
-|-------|-----------------|--------------|
-| WSL2 | — | Windows Features |
-| Minikube | ≥ 1.28 | [minikube.sigs.k8s.io](https://minikube.sigs.k8s.io) |
-| Helm | ≥ 3.12 | `snap install helm --classic` |
-| Terraform | ≥ 1.6 | `snap install terraform` |
-| kubectl | ≥ 1.28 | Via Minikube ou `snap install kubectl` |
-| Docker | ≥ 24.0 | Requis comme driver Minikube |
+| Outil | Version minimale |
+|-------|-----------------|
+| Minikube | ≥ 1.30 |
+| kubectl | ≥ 1.28 |
+| Helm | ≥ 3.12 |
+| Terraform | ≥ 1.0 |
+| Docker | ≥ 24.0 (driver Minikube) |
+| Python | ≥ 3.10 (pour le producteur) |
+| jq, curl | toute version récente |
 
-### Démarrage de Minikube
+### Ressources machine
 
-```bash
-minikube start --cpus=2 --memory=3072 --driver=docker
-```
+Ce PoC est dimensionné pour une machine avec **16 Go de RAM** :
 
-> **Contraintes de ressources** : Le cluster est dimensionné pour 2 vCPU et 3 072 Mo de RAM.
-> Les images sont pré-chargées via `minikube image load` pour éviter les problèmes de pull réseau.
-
-### Alias kubectl recommandés
-
-```bash
-alias k='kubectl'
-alias kgp='kubectl get pods'
-alias kga='kubectl get pods -A'
-alias kns='kubectl config set-context --current --namespace'
-```
+- Minikube : 7168 Mo de RAM, 4 CPUs
+- Budget mémoire pods : ~5,6 Go pour Flink (4 × JM 768m + TM 640m) + ~768 Mo Kafka/ZK + MinIO + opérateurs
 
 ---
 
 ## 4. Structure du projet
 
 ```
-infrastructure-projet/
-├── .gitignore                    # Exclut .terraform/, tfstate, tfvars
-├── README.md                     # Ce document
-├── Operations_card_*.csv         # Données bancaires source
-├── main.tf                       # Module kafka_infrastructure
-├── namespaces.tf                 # Namespaces : kafka / flink / minio
-├── kafka.tf                      # (référence module)
-├── minio.tf                      # Déploiement MinIO + Service
-├── flink.tf                      # JobManager + TaskManager + Service
-├── providers.tf                  # Provider Kubernetes
-├── variables.tf                  # Variables Terraform
-└── modules/
-    └── kafka/
-        ├── deployment.tf         # Déploiement apache/kafka:3.8.0
-        ├── service.tf            # Service Kafka port 9092
-        ├── network_policies.tf   # default-deny + allow-flink-to-kafka
-        └── rbac.tf               # Role + RoleBinding Flink
+POC_Streaming/
+├── setup_poc.sh              # Point d'entrée unique — cycle de vie complet
+├                
+├── README.md                 # Ce document
+│
+├── flink-jobs/               # Image Docker PyFlink + 4 jobs
+│   ├── Dockerfile            # Flink 1.18 + Python + plugin S3 hadoop + Kafka connector
+│   ├── requirements.txt      # apache-flink, numpy, pyarrow, cryptography
+│   ├── job1_decryption.py
+│   ├── job2_validation.py
+│   ├── job3_normalization.py
+│   ├── job4_sink.py
+│   └── common/
+│       ├── crypto.py         # Chiffrement/déchiffrement Fernet
+│       └── iso_standards.py  # Dictionnaires ISO + Luhn + masquage PAN
+│
+├── producer/                 # Producteur Kafka local
+│   ├── producer.py
+│   └── requirements.txt      # kafka-python, pandas, cryptography, lz4
+│
+├── terraform/                # Stage 1 (généré par setup_poc.sh, git-ignoré)
+│   └── stage2/               # Stage 2 (généré par setup_poc.sh, git-ignoré)
+│
+├── k8s/                      # Manifests Kubernetes (générés, git-ignorés)
+│   ├── flink-rbac.yaml
+│   └── network-policies.yaml
+│
+└── data/                     # Fichiers CSV de test (git-ignorés, PAN/PII)
 ```
 
 ---
 
 ## 5. Composants déployés
 
-### 5.1 Apache Kafka — namespace `kafka`
+### 5.1 Apache Kafka — namespace `ingestion`
 
-| Ressource | Nom | Détail |
-|-----------|-----|--------|
-| Deployment | `kafka-deployment` | Image `apache/kafka:3.8.0` |
-| Service | `kafka-service` | ClusterIP, port 9092 |
-| NetworkPolicy | `default-deny-all` | Bloque tout trafic entrant |
-| NetworkPolicy | `allow-flink-to-kafka` | Autorise Flink → port 9092 |
-| Role | `flink-role` | Permissions Kubernetes pour Flink |
-| RoleBinding | `flink-role-binding` | Lie le role au ServiceAccount |
+| Ressource | Détail |
+|-----------|--------|
+| Opérateur | Strimzi 0.43.0 |
+| Broker | Kafka 3.8.0, 1 réplique, stockage éphémère |
+| ZooKeeper | 1 réplique, stockage éphémère |
+| Listeners | `plain:9092` (interne) + `nodeport:9094` (externe) |
+| Bootstrap interne | `payments-cluster-kafka-bootstrap.ingestion.svc:9092` |
 
-**Configuration KRaft (sans Zookeeper) :**
+**Topics du pipeline :**
+
+| Topic | Partitions | Rétention | Usage |
+|-------|-----------|-----------|-------|
+| `payments` | 1 | 7 jours | Enveloppes chiffrées (entrée producteur) |
+| `payments.decrypted` | 1 | 7 jours | Enveloppes déchiffrées (Job 1 → Job 2) |
+| `payments.validated` | 1 | 7 jours | Enveloppes validées (Job 2 → Job 3) |
+| `payments.normalized` | 1 | 7 jours | Enregistrements canoniques (Job 3 → Job 4) |
+| `payments.dlq` | 1 | 30 jours | Dead Letter Queue (rejets Jobs 1 et 2) |
+
+### 5.2 Apache Flink — namespace `traitement`
+
+| Ressource | Détail |
+|-----------|--------|
+| Opérateur | Flink Kubernetes Operator 1.10.0 |
+| Mode | Application (1 JobManager par job) |
+| Image Docker | `rt-payments-flink-jobs:1.0` (locale, `imagePullPolicy: Never`) |
+| JobManager | 768 Mo RAM, 0.25 CPU |
+| TaskManager | 640 Mo RAM, 0.5 CPU |
+| Checkpointing | AT_LEAST_ONCE, toutes les 120s, pause min 60s |
+| Restart strategy | Exponentielle : 5s → 5min |
+
+**Tuning mémoire JVM (critique pour le PoC) :**
+
+Les valeurs par défaut de l'overhead JVM (256 Mo metaspace + 192 Mo overhead) ne laissent pas assez de mémoire Flink dans de petits conteneurs. Les valeurs ajustées :
 
 ```
-KAFKA_NODE_ID=1
-KAFKA_PROCESS_ROLES=broker,controller
-KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
-KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093
-KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+jvm-metaspace.size = 128mb   (défaut : 256mb)
+jvm-overhead.min   = 64mb    (défaut : 192mb)
+managed.fraction   = 0.2     (défaut : 0.40 — Python nécessite moins)
 ```
 
-### 5.2 Apache Flink — namespace `flink`
+Résultat : JM 768m → 563m mémoire Flink ✓ | TM 640m → 448m mémoire Flink ✓
 
-| Ressource | Nom | Détail |
-|-----------|-----|--------|
-| Deployment | `flink-jobmanager` | 1 réplique, REST UI :8081 |
-| Deployment | `flink-taskmanager` | 1 réplique |
-| Service | `flink-jobmanager-service` | ClusterIP, ports 6123 (RPC) + 8081 (UI) |
+### 5.3 MinIO — namespace `stockage`
 
-### 5.3 MinIO — namespace `minio`
-
-| Ressource | Nom | Détail |
-|-----------|-----|--------|
-| Deployment | `minio-deployment` | Image `minio/minio:latest` |
-| Service | `minio-service` | ClusterIP, port 9000 (API) + 9001 (Console) |
-
-**Credentials par défaut :**
-- User : `minioadmin`
-- Password : `minioadmin`
+| Paramètre | Valeur |
+|-----------|--------|
+| Mode | Standalone |
+| Bucket | `rt-payments` |
+| Endpoint interne | `http://minio.stockage.svc:9000` |
+| Persistence | Désactivée (PoC éphémère) |
+| Credentials | `minioadmin` / `minioadmin` |
+| Chemin de sortie | `s3a://rt-payments/canonical/` |
 
 ---
 
-## 6. Déploiement
+## 6. Les jobs Flink — Détail complet
 
-### Étape 1 — Pré-charger les images dans Minikube
+### Architecture commune à tous les jobs
 
-> ⚠️ Les images `bitnami/kafka` n'étant plus disponibles sur Docker Hub, on utilise les images officielles Apache et on les charge directement dans Minikube pour éviter tout problème de pull réseau.
+Chaque job PyFlink suit le même patron :
+- **Source Kafka** : `KafkaSource` avec `SimpleStringSchema` (messages lus comme chaînes JSON)
+- **Traitement** : `ProcessFunction` ou `MapFunction` PyFlink
+- **Sink Kafka** : `KafkaSink` avec garantie `AT_LEAST_ONCE`
+- **Checkpointing** : toutes les 60 secondes
+- **Parallélisme** : 1 (configurable via `PARALLELISM` env var)
+- **Offsets** : lecture depuis le début (`earliest()`)
 
-```bash
-# Télécharger les images depuis WSL
-docker pull apache/kafka:3.8.0
-docker pull apache/flink:1.18.1
-docker pull minio/minio:latest
+---
 
-# Charger dans Minikube (5-10 min par image)
-minikube image load apache/kafka:3.8.0
-minikube image load apache/flink:1.18.1
-minikube image load minio/minio:latest
+### Job 1 — Décryption (`job1_decryption.py`)
+
+**Source** : topic `payments`
+**Sorties** : topic `payments.decrypted` (succès) | topic `payments.dlq` (échec)
+
+Chaque message reçu est une **enveloppe JSON chiffrée** produite par `producer.py` :
+
+```json
+{
+  "eventId": "evt-00000001",
+  "schemaVersion": "1.0",
+  "source": "powercard-csv",
+  "encrypted_payload": "gAAAAABk...==",
+  "producedAt": 1748700000000
+}
 ```
 
-### Étape 2 — Initialiser Terraform
+La `ProcessFunction` `DecryptFn` :
+1. Parse le JSON et extrait le champ `encrypted_payload`
+2. Déchiffre avec Fernet (clé chargée depuis la variable d'environnement `FERNET_KEY`)
+3. Remplace `encrypted_payload` par `payload` (le dict Python des colonnes CSV)
+4. Ajoute un horodatage de traitement dans `_processing.decryptedAt`
+5. Émet sur le flux principal (`payments.decrypted`)
 
-```bash
-cd ~/infrastructure-projet
-terraform init
+En cas d'erreur (token invalide, JSON malformé, champ manquant), un message d'erreur structuré est émis via **side output** vers `payments.dlq` :
+```json
+{
+  "stage": "decryption",
+  "errorCode": "DECRYPT_FAILED",
+  "errorMessage": "InvalidToken: ...",
+  "originalMessage": "...",
+  "timestamp": 1748700000000
+}
 ```
 
-### Étape 3 — Planifier
-
-```bash
-terraform plan
-```
-
-### Étape 4 — Appliquer
-
-```bash
-terraform apply
-```
-
-> ⚠️ Taper exactement `yes` (minuscules) pour confirmer.
-
-### Étape 5 — Vérifier
-
-```bash
-kubectl get pods -A
-```
-
-Résultat attendu :
-
-```
-NAMESPACE   NAME                                 READY   STATUS    RESTARTS
-kafka       kafka-deployment-xxxxx               1/1     Running   0
-flink       flink-jobmanager-xxxxx               1/1     Running   0
-flink       flink-taskmanager-xxxxx              1/1     Running   0
-minio       minio-deployment-xxxxx               1/1     Running   0
+**Sortie nominale :**
+```json
+{
+  "eventId": "evt-00000001",
+  "payload": {
+    "MESSAGE_TYPE": "1100",
+    "CARD_NUMBER": "4539578763621486",
+    "TRANSACTION_AMOUNT": "150.00",
+    "TRANSACTION_CURRENCY": "840"
+  },
+  "_processing": { "decryptedAt": 1748700001234 }
+}
 ```
 
 ---
 
-## 7. Vérification de l'état du cluster
+### Job 2 — Validation (`job2_validation.py`)
 
-```bash
-# Tous les pods
-kubectl get pods -A
+**Source** : topic `payments.decrypted`
+**Sorties** : topic `payments.validated` (valide) | topic `payments.dlq` (invalide)
 
-# Namespaces
-kubectl get namespaces
+La fonction `validate(payload)` applique quatre contrôles de conformité ISO :
 
-# Services
-kubectl get svc -A
+| Contrôle | Standard | Champ | Règle |
+|----------|----------|-------|-------|
+| Champs obligatoires | — | `MESSAGE_TYPE`, `CARD_NUMBER`, `TRANSACTION_AMOUNT`, `TRANSACTION_CURRENCY` | Tous doivent être présents et non vides |
+| MTI valide | ISO 8583 | `MESSAGE_TYPE` | Doit être l'un des 15 MTI connus (1100–1430) |
+| Devise valide | ISO 4217 | `TRANSACTION_CURRENCY` | Code numérique 3 chiffres dans le dictionnaire des devises |
+| Algorithme de Luhn | ISO 7812 | `CARD_NUMBER` | Checksum mod-10 doit être valide |
 
-# Network Policies
-kubectl get networkpolicy -A
+**Si valide**, l'enveloppe est enrichie et émise sur `payments.validated` :
+```json
+{ "validation": { "valid": true }, "_processing": { "validatedAt": 1748700002000 } }
+```
 
-# RBAC
-kubectl get role,rolebinding -A
+**Si invalide**, une liste structurée d'erreurs est envoyée sur `payments.dlq` :
+```json
+{
+  "validation": {
+    "valid": false,
+    "errors": [
+      { "code": "ISO7812_LUHN_FAILED", "field": "CARD_NUMBER", "valueBin": "453957" },
+      { "code": "ISO4217_INVALID_CURRENCY", "field": "TRANSACTION_CURRENCY", "value": "999" }
+    ]
+  },
+  "stage": "validation"
+}
 ```
 
 ---
 
-## 8. Sécurité réseau et RBAC
+### Job 3 — Normalisation (`job3_normalization.py`)
+
+**Source** : topic `payments.validated`
+**Sortie** : topic `payments.normalized`
+(pas de DLQ — les données ont déjà été validées)
+
+La `MapFunction` `NormalizeFn` convertit l'enveloppe brute ISO 8583 en un **schéma canonique** inspiré d'ISO 20022 pacs.008 :
+
+| Transformation | Standard | Exemple |
+|---------------|----------|---------|
+| Normalisation des dates | ISO 8601 | `"16/09/2025 09:49:28"` → `"2025-09-16T09:49:28Z"` |
+| Masquage PAN | PCI DSS 3.4 | `"4539578763621486"` → `"453957******1486"` |
+| Extraction BIN | ISO 7812 | `"4539578763621486"` → `"453957"` |
+| Détection réseau carte | BIN ranges | `"4..."` → `"VISA"` |
+| Expansion devise | ISO 4217 | `"840"` → `{ "code": "840", "alpha": "USD", "minorUnits": 2 }` |
+| Enrichissement MCC | ISO 18245 | `"5812"` → `"Eating Places, Restaurants"` |
+| Expansion MTI | ISO 8583 | `"1100"` → `"Authorization Request"` |
+
+**Schéma canonique de sortie :**
+```json
+{
+  "msgId": "evt-00000001",
+  "schema": "rt-payments-canonical-v1",
+  "creDtTm": "2025-09-16T09:49:28Z",
+  "businessDate": "2025-09-16",
+  "iso8583": {
+    "mti": "1100",
+    "mtiName": "Authorization Request",
+    "processingCode": "000000"
+  },
+  "transaction": {
+    "amount": { "value": 150.0, "currencyCode": "840", "currencyAlpha": "USD", "minorUnits": 2 },
+    "transactionLocalDate": "2025-09-16T09:49:28Z"
+  },
+  "card": {
+    "panMasked": "453957******1486",
+    "panBin": "453957",
+    "scheme": "VISA",
+    "expiryDate": "2027-12-01T00:00:00Z"
+  },
+  "merchant": {
+    "id": "MERCH001",
+    "name": "SUPER CARREFOUR",
+    "mcc": "5411",
+    "mccDescription": "Grocery Stores, Supermarkets",
+    "terminalId": "TERM0042"
+  },
+  "acquirer": { "institutionCode": "...", "bank": "...", "countryCode": "..." },
+  "issuer": { "bank": "...", "networkCode": "..." },
+  "audit": { "stan": "123456", "rrn": "000000123456", "authCode": "ABC123" },
+  "_processing": { "decryptedAt": ..., "validatedAt": ..., "normalizedAt": 1748700003000 }
+}
+```
+
+---
+
+### Job 4 — Sink MinIO (`job4_sink.py`)
+
+**Source** : topic `payments.normalized`
+**Sortie** : MinIO `s3a://rt-payments/canonical/`
+
+Ce job utilise l'API `FileSink` (Sink2) de Flink pour écrire les enregistrements canoniques en **JSON Lines** (`.jsonl`) vers MinIO.
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Format | `Encoder.simple_string_encoder("UTF-8")` (JSON Lines) |
+| Préfixe des fichiers | `payments` |
+| Suffixe | `.jsonl` |
+| Rolling — taille max | 64 Mo |
+| Rolling — timeout | 60 secondes |
+| Rolling — inactivité | 30 secondes |
+
+**Pourquoi le plugin `flink-s3-fs-hadoop` et non `presto` ?**
+L'API `FileSink` appelle `createRecoverableWriter()` lors de la construction du graphe de flux. Seul le plugin **hadoop** implémente `RecoverableWriter`. Le plugin **presto** génère une `FlinkRuntimeException: Could not create committable serializer` au démarrage.
+
+---
+
+### Bibliothèque commune (`common/`)
+
+#### `crypto.py`
+
+| Fonction | Description |
+|----------|-------------|
+| `get_fernet()` | Charge la clé depuis `FERNET_KEY` env var → objet `Fernet` |
+| `encrypt_dict(payload)` | `dict` → JSON → chiffrement Fernet → base64 → `str` |
+| `decrypt_dict(token)` | `str` (base64) → décodage → déchiffrement → JSON → `dict` |
+
+#### `iso_standards.py`
+
+| Composant | Contenu |
+|-----------|---------|
+| `ISO8583_MTI` | Dictionnaire des 15 MTI Powercard (1100 → 1430) |
+| `ISO4217` | 23 codes de devise (numeric → alpha + minorUnits) |
+| `MCC` | 18 Merchant Category Codes (hôtels, restauration, ATM, etc.) |
+| `luhn_check(pan)` | Validation mod-10 per ISO/IEC 7812-1 |
+| `card_scheme(pan)` | Détection VISA / MASTERCARD / AMEX / UNIONPAY / DISCOVER |
+| `mask_pan(pan)` | Masquage PCI DSS (6 premiers + 4 derniers digits) |
+| `to_iso8601(value)` | Normalisation date multi-format → `YYYY-MM-DDTHH:MM:SSZ` |
+| `business_date_from(value)` | Extraction clé de partition `YYYY-MM-DD` |
+
+---
+
+## 7. Déploiement
+
+### 7.1 Déploiement automatique (recommandé)
+
+```bash
+./setup_poc.sh up
+```
+
+Ce script exécute dans l'ordre :
+1. Vérification des prérequis (minikube, kubectl, helm, terraform, jq, curl)
+2. Démarrage de Minikube (7168 Mo, 4 CPUs, driver Docker)
+3. Génération des fichiers `.tf` et manifests K8s depuis les heredocs
+4. Terraform Stage 1 : namespaces + opérateurs + attente des CRDs
+5. Terraform Stage 2 : Kafka cluster + topics + FlinkDeployments + secrets Fernet
+6. Application RBAC + NetworkPolicies
+7. Build de l'image Docker PyFlink dans le daemon Minikube
+8. Attente que les 4 jobs Flink atteignent l'état `STABLE`
+9. Affichage du résumé et des commandes de port-forward
+
+### 7.2 Opérations ciblées
+
+```bash
+# Rebuild de l'image Docker seulement (après modification d'un job)
+./setup_poc.sh build
+
+# Re-déployer uniquement les jobs Flink (après setup_poc.sh build)
+./setup_poc.sh jobs
+
+# Voir l'état des pods dans les 3 namespaces
+./setup_poc.sh status
+```
+
+### 7.3 Accès à l'interface Flink
+
+Chaque job étant en mode application, chacun a sa propre UI :
+
+```bash
+kubectl port-forward svc/job1-decryption-rest    8081:8081 -n traitement &
+kubectl port-forward svc/job2-validation-rest    8082:8081 -n traitement &
+kubectl port-forward svc/job3-normalization-rest 8083:8081 -n traitement &
+kubectl port-forward svc/job4-sink-rest          8084:8081 -n traitement &
+```
+
+Ouvrir `http://localhost:8081` à `http://localhost:8084`.
+
+---
+
+## 8. Vérification de l'état du cluster
+
+```bash
+# État de tous les jobs Flink (vue synthétique)
+kubectl get flinkdeployment -n traitement
+
+# Pods par namespace
+kubectl get pods -n ingestion
+kubectl get pods -n traitement
+kubectl get pods -n stockage
+
+# Logs d'un job spécifique
+kubectl logs -n traitement <pod-name> -c flink-main-container
+
+# État des topics Kafka
+kubectl get kafkatopic -n ingestion
+
+# Vérifier les fichiers produits dans MinIO
+kubectl exec -n stockage deployment/minio -- \
+  mc ls local/rt-payments/canonical/ --recursive
+```
+
+**État nominal attendu :**
+
+```
+NAME                  JOB STATUS   LIFECYCLE STATE
+job1-decryption       RUNNING      STABLE
+job2-validation       RUNNING      STABLE
+job3-normalization    RUNNING      STABLE
+job4-sink             RUNNING      STABLE
+```
+
+---
+
+## 9. Exécution du producteur
+
+### Lancement
+
+```bash
+./setup_poc.sh produce "data/<fichier>.csv"
+./setup_poc.sh produce "data/<fichier>.csv" 50 200   # rate=50/s, limit=200 lignes
+```
+
+Le script crée automatiquement un venv Python (`.producer-venv/`) et installe les dépendances au premier lancement.
+
+### Format des messages publiés
+
+Chaque message Kafka est un objet JSON avec l'enveloppe suivante :
+
+```json
+{
+  "eventId": "evt-00000042",
+  "schemaVersion": "1.0",
+  "source": "powercard-csv",
+  "encrypted_payload": "gAAAAABk...==",
+  "producedAt": 1748700000000
+}
+```
+
+| Champ | Description |
+|-------|-------------|
+| `eventId` | Identifiant séquentiel unique (`evt-XXXXXXXX`) |
+| `encrypted_payload` | Payload Fernet (AES-128-CBC + HMAC-SHA256), base64-encodé |
+| `producedAt` | Timestamp Unix en millisecondes (UTC) |
+
+### Paramètres du producteur
+
+| Argument | Défaut | Description |
+|----------|--------|-------------|
+| `--csv` | *(requis)* | Chemin vers le fichier CSV Powercard |
+| `--bootstrap` | `localhost:9094` | Adresse du broker Kafka |
+| `--topic` | `payments` | Topic de destination |
+| `--rate` | `20.0` | Messages par seconde |
+| `--limit` | `0` (toutes les lignes) | Nombre max de lignes à envoyer |
+
+---
+
+## 10. Sécurité réseau et RBAC
 
 ### NetworkPolicies
 
 | Politique | Namespace | Effet |
 |-----------|-----------|-------|
-| `default-deny-all` | `kafka`, `flink`, `minio` | Bloque tout trafic entrant par défaut |
-| `allow-flink-to-kafka` | `kafka` | Autorise namespace `flink` → port 9092 |
+| Deny ingress par défaut | `ingestion`, `traitement`, `stockage` | Tout trafic entrant bloqué par défaut |
+| `allow-flink-to-kafka` | `ingestion` | Autorise le namespace `traitement` → port 9092 |
+| `allow-flink-to-minio` | `stockage` | Autorise le namespace `traitement` → port 9000 |
 
 ### RBAC Flink
 
-Le `Role` `flink-role` dans le namespace `flink` est lié via `flink-role-binding` pour permettre aux jobs Flink d'interagir avec l'API Kubernetes (lecture des pods, services, configmaps).
+Le `ServiceAccount` `flink` (namespace `traitement`) est lié au `ClusterRole/edit` via un `ClusterRoleBinding`, permettant aux jobs Flink de créer et gérer leurs propres ressources Kubernetes (pods TaskManager, ConfigMaps).
+
+### Chiffrement Fernet
+
+- La clé Fernet est générée une seule fois dans `.fernet.key` à la racine (git-ignoré)
+- Elle est provisionnée comme Kubernetes Secret `fernet-key` dans les namespaces `ingestion` ET `traitement`
+- Le producteur la lit via `FERNET_KEY` env var (injectée par `setup_poc.sh`)
+- Job 1 la lit depuis le Secret via `FERNET_KEY` env var
 
 ---
 
-## 9. Dépannage — Problèmes rencontrés
+## 11. Dépannage — Problèmes rencontrés
 
-### 9.1 `bitnami/kafka` introuvable sur Docker Hub
+### ZooKeeper — zxid mismatch après redémarrage
 
-**Symptôme :**
-```
-manifest for bitnami/kafka:3.7.0 not found: manifest unknown
-manifest for bitnami/kafka:3.9 not found: manifest unknown
-```
+**Symptôme :** Le pod Kafka entre en `CrashLoopBackOff`, Strimzi affiche `ForceableProblem` avec une divergence de zxid.
 
-**Cause :** Bitnami a supprimé ses images de Docker Hub public. Les tags `3.x` n'existent plus.
+**Cause :** Le stockage est éphémère. Quand ZK redémarre, il perd son journal de transactions. Si le broker Kafka est toujours en vie avec un zxid supérieur, ZK refuse la connexion.
 
-**Solution :** Migrer vers l'image officielle Apache :
-```hcl
-# Dans modules/kafka/deployment.tf
-image = "apache/kafka:3.8.0"
-```
+**Solution :** Supprimer les deux pods simultanément pour les forcer à repartir d'un état vierge :
 
-Et pré-charger l'image dans Minikube :
 ```bash
-docker pull apache/kafka:3.8.0
-minikube image load apache/kafka:3.8.0
+kubectl delete pod payments-cluster-zookeeper-0 payments-cluster-kafka-0 -n ingestion
 ```
 
 ---
 
-### 9.2 Terraform timeout — `Waiting for rollout to finish`
+### Flink — job en `RECONCILING` indéfiniment
 
-**Symptôme :**
-```
-Error: Waiting for rollout to finish: 1 old replicas are pending termination...
-```
-
-**Cause :** Minikube avec 2 CPUs / 3072MB est lent pour les rolling updates. Terraform timeout avant que le pod soit `Running`.
-
-**Solution :** Ajouter `timeouts` et `strategy = Recreate` dans le deployment :
-```hcl
-timeouts {
-  create = "15m"
-  update = "15m"
-  delete = "15m"
-}
-
-spec {
-  strategy {
-    type = "Recreate"
-  }
-}
-```
-
----
-
-### 9.3 Terraform n'accepte pas `YES` en majuscule
-
-**Symptôme :**
-```
-Apply cancelled.
-```
-
-**Solution :** Toujours taper `yes` (minuscules) pour confirmer.
-
----
-
-### 9.4 Pods bloqués en `Terminating` après Ctrl+C
+**Cause fréquente :** L'image Docker n'a pas été rechargée dans le daemon Minikube après une modification.
 
 **Solution :**
-```bash
-kubectl delete pod -n kafka --all --force --grace-period=0
-```
-
----
-
-### 9.5 Vieux pods `my-kafka-controller` dans le namespace `default`
-
-**Cause :** Ancienne installation Helm de Kafka laissant un StatefulSet.
-
-**Solution :**
-```bash
-kubectl delete statefulset my-kafka-controller -n default
-kubectl delete pod my-kafka-controller-0 my-kafka-controller-1 my-kafka-controller-2 \
-  -n default --force --grace-period=0
-```
-
----
-
-### 9.6 `minio.tf` et `flink.tf` vides — aucun pod déployé
-
-**Cause :** Les fichiers `.tf` étaient créés mais vides (0 bytes). Terraform ne déploie rien sans contenu.
-
-**Solution :** Remplir les fichiers avec les ressources `kubernetes_deployment_v1` et `kubernetes_service_v1`, puis relancer `terraform apply`.
-
----
-
-### 9.7 Push GitHub rejeté — authentification par mot de passe non supportée
-
-**Symptôme :**
-```
-remote: Invalid username or token. Password authentication is not supported.
-```
-
-**Cause :** GitHub n'accepte plus les mots de passe depuis 2021.
-
-**Solution :** Créer un **Personal Access Token** sur [github.com/settings/tokens/new](https://github.com/settings/tokens/new) avec le scope `repo`, et l'utiliser comme mot de passe lors du push :
-```bash
-git push -u origin main:oussama
-# Username: 0ussama04
-# Password: ghp_xxxxxxxxxxxx  ← Personal Access Token
-```
-
----
-
-## 10. Suppression de l'infrastructure
 
 ```bash
-# Supprimer toute l'infrastructure Terraform
-cd ~/infrastructure-projet
-terraform destroy -auto-approve
-
-# Supprimer les pods résiduels
-kubectl delete pod --all -n kafka --force --grace-period=0
-kubectl delete pod --all -n flink --force --grace-period=0
-kubectl delete pod --all -n minio --force --grace-period=0
-
-# Optionnel : arrêter Minikube
-minikube stop
+eval $(minikube docker-env)
+docker build -t rt-payments-flink-jobs:1.0 flink-jobs/
+kubectl delete flinkdeployment <job-name> -n traitement
+./setup_poc.sh jobs
 ```
 
 ---
 
-*DGS-Streaming — Infrastructure v1.0 | Branche : `oussama` | SWAM*
+### Flink — `FlinkRuntimeException: Could not create committable serializer`
+
+**Cause :** Job 4 utilise le plugin S3 `presto` qui n'implémente pas `RecoverableWriter`.
+
+**Solution :** Le `Dockerfile` doit utiliser `flink-s3-fs-hadoop` :
+
+```dockerfile
+RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
+    cp /opt/flink/opt/flink-s3-fs-hadoop-${FLINK_VERSION}.jar /opt/flink/plugins/s3-fs-hadoop/
+```
+
+---
+
+### Flink — `Found 0 flink-python jar`
+
+**Cause :** Le jar Python a été déplacé (`mv`) hors de `/opt/flink/opt/`. `PackagedProgramUtils.getPythonJar()` scanne ce répertoire et requiert exactement un `flink-python*.jar`.
+
+**Solution :** Utiliser un lien symbolique (`ln -sf`), pas `mv` :
+
+```dockerfile
+RUN mkdir -p /opt/flink/python-driver && \
+    ln -sf /opt/flink/opt/flink-python-${FLINK_VERSION}.jar \
+           /opt/flink/python-driver/flink-python.jar
+```
+
+---
+
+### Flink — Validation mémoire `64mb < 128mb`
+
+**Cause :** Les valeurs par défaut JVM (metaspace 256 Mo + overhead 192 Mo) laissent moins de 128 Mo de mémoire Flink dans un conteneur de 512 Mo.
+
+**Solution :** Augmenter les conteneurs (JM = 768 Mo, TM = 640 Mo) et réduire les minimums JVM :
+
+```
+jobmanager.memory.jvm-metaspace.size = 128mb
+jobmanager.memory.jvm-overhead.min   = 64mb
+taskmanager.memory.jvm-metaspace.size = 128mb
+taskmanager.memory.jvm-overhead.min   = 64mb
+```
+
+---
+
+### Terraform — État divergent du cluster
+
+**Symptôme :** `terraform apply` échoue avec `resource already exists`.
+
+**Solution :** Le script `setup_poc.sh` exécute automatiquement `_tf_import_if_missing()` avant chaque apply. En cas de problème persistant :
+
+```bash
+./setup_poc.sh down
+./setup_poc.sh up
+```
+
+---
+
+### Producteur — venv corrompu
+
+```bash
+rm -rf .producer-venv
+./setup_poc.sh produce "data/<fichier>.csv"
+```
+
+---
+
+## 12. Suppression de l'infrastructure
+
+```bash
+# Tout supprimer (Terraform destroy + Minikube stop)
+./setup_poc.sh down
+```
+
+Ce script :
+1. Désinstalle les releases Helm (opérateurs)
+2. Supprime les ClusterRoleBindings
+3. Exécute `terraform destroy` (Stage 2 puis Stage 1)
+4. Supprime les namespaces (en forçant la suppression des finalizers)
+5. Arrête Minikube
+
+```bash
+# Supprimer uniquement le venv producteur
+rm -rf .producer-venv
+```
