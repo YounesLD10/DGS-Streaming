@@ -3,3 +3,5 @@ terraform.tfstate
 terraform.tfstate.backup
 *.tfvars
 .terraform.lock.hcl
+data.csv
+terraform.tfstate.1779703926.backup
