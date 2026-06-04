@@ -1,0 +1,27 @@
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: datamart-sink-connector
+  namespace: ingestion
+  labels:
+    strimzi.io/cluster: payments-connect-cluster
+spec:
+  class: io.confluent.connect.jdbc.JdbcSinkConnector
+  tasksMax: 1
+  config:
+    connection.url: jdbc:postgresql://datamart-svc:5432/datamart_db
+    connection.user: ${file:/opt/kafka/secrets/dm-creds.properties:username}
+    connection.password: ${file:/opt/kafka/secrets/dm-creds.properties:password}
+    topics: payments.normalized
+    table.name.format: fact_transactions
+    insert.mode: upsert
+    pk.mode: record_value
+    pk.fields: transaction_id
+    auto.create: false
+    auto.evolve: false
+    batch.size: 200
+    max.retries: 3
+    retry.backoff.ms: 3000
+    errors.tolerance: none
+    errors.log.enable: true
+    errors.deadletterqueue.topic.name: payments.dlq
