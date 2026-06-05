@@ -61,7 +61,10 @@ from pyflink.datastream import (
     StreamExecutionEnvironment,
 )
 from pyflink.datastream.connectors.kafka import (
+    DeliveryGuarantee,
     KafkaOffsetsInitializer,
+    KafkaRecordSerializationSchema,
+    KafkaSink,
     KafkaSource,
 )
 from pyflink.datastream.functions import KeyedProcessFunction, MapFunction
@@ -74,6 +77,7 @@ from common.config import (
     MINIO_BUCKET,
     MINIO_ENDPOINT,
     MINIO_SECRET_KEY,
+    TOPIC_GOLD,
     TOPIC_NORMALIZED,
 )
 from common.minio_sink import ensure_bucket, get_minio_client, write_record
@@ -205,6 +209,23 @@ class GoldMinioFn(MapFunction):
         return value
 
 
+# ── KafkaSink factory ──────────────────────────────────────────────────────────
+
+def _kafka_sink(topic: str) -> KafkaSink:
+    return (
+        KafkaSink.builder()
+        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
+        .set_record_serializer(
+            KafkaRecordSerializationSchema.builder()
+            .set_topic(topic)
+            .set_value_serialization_schema(SimpleStringSchema())
+            .build()
+        )
+        .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+        .build()
+    )
+
+
 # ── Job entry point ────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -242,19 +263,19 @@ def main() -> None:
         .name("OptimizeFn")
     )
 
-    # Write gold records to MinIO; .print() is the terminal Java-backed operator
-    # that drives Flink's execution graph (SinkFunction cannot be subclassed in Python).
     (
         processed
         .map(GoldMinioFn(), output_type=Types.STRING())
         .uid("gold-minio-fn")
         .name("GoldMinioFn")
-        .print()
+        .sink_to(_kafka_sink(TOPIC_GOLD))
+        .uid("payments-gold-sink")
+        .name("payments.gold sink")
     )
 
     log.info(
-        "Submitting job: rt-payments-job4-optimization | source=%s | sink=MinIO gold",
-        TOPIC_NORMALIZED,
+        "Submitting job: rt-payments-job4-optimization | source=%s | sink=MinIO gold + %s",
+        TOPIC_NORMALIZED, TOPIC_GOLD,
     )
     env.execute("rt-payments-job4-optimization")
 

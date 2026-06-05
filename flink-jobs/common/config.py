@@ -35,3 +35,4 @@ TOPIC_DECRYPTED: str = "payments.decrypted"
 TOPIC_VALIDATED: str = "payments.validated"
 TOPIC_NORMALIZED: str = "payments.normalized"
 TOPIC_DLQ: str = "payments.dlq"
+TOPIC_GOLD: str = os.getenv("TOPIC_GOLD", "payments.gold")

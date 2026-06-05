@@ -65,6 +65,13 @@ from common.config import (
     TOPIC_NORMALIZED,
     TOPIC_VALIDATED,
 )
+from common.iso_standards import (
+    ISO8583_MTI,
+    card_scheme,
+    currency_alpha,
+    currency_minor_units,
+    mcc_description,
+)
 from common.minio_sink import ensure_bucket, get_minio_client, write_record
 
 logging.basicConfig(
@@ -176,6 +183,17 @@ class NormalizeFn(ProcessFunction):
             record["source_system"]    = SOURCE_SYSTEM
             record["pipeline_version"] = PIPELINE_VERSION
             record.setdefault("_meta", {})["job"] = "job3-normalize"
+
+            pan      = str(tx.get("CARD_NUMBER", "")).strip()
+            mcc      = str(tx.get("CARD_ACCEPTOR_ACTIVITY", "")).strip()
+            mti      = str(tx.get("MESSAGE_TYPE", "")).strip()
+            currency = str(tx.get("TRANSACTION_CURRENCY", "")).strip()
+
+            record["card_scheme"]          = card_scheme(pan)
+            record["mcc_description"]      = mcc_description(mcc)
+            record["mti_name"]             = ISO8583_MTI.get(mti)
+            record["currency_alpha"]       = currency_alpha(currency)
+            record["currency_minor_units"] = currency_minor_units(currency)
 
             yield json.dumps(record, ensure_ascii=False)
 

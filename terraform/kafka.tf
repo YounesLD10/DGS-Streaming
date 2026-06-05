@@ -151,10 +151,62 @@ spec:
   replicas: 1
   config:
     retention.ms: "259200000"
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: payments.decrypted
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: hps-cluster
+spec:
+  partitions: 3
+  replicas: 1
+  config:
+    retention.ms: "86400000"
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: payments.validated
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: hps-cluster
+spec:
+  partitions: 3
+  replicas: 1
+  config:
+    retention.ms: "86400000"
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: payments.normalized
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: hps-cluster
+spec:
+  partitions: 3
+  replicas: 1
+  config:
+    retention.ms: "86400000"
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: payments.gold
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: hps-cluster
+spec:
+  partitions: 3
+  replicas: 1
+  config:
+    retention.ms: "604800000"
 YAML
 
       echo "[kafka] Waiting for topics..."
-      for topic in payments payments.dlq; do
+      for topic in payments payments.dlq payments.decrypted payments.validated payments.normalized payments.gold; do
         for i in $(seq 1 30); do
           ready=$(minikube kubectl -- get kafkatopic "$topic" -n kafka \
             -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)

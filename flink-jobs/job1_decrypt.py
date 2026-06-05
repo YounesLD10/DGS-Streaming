@@ -95,7 +95,7 @@ class DecryptFn(ProcessFunction):
     def open(self, runtime_context) -> None:
         self._fernet = make_fernet(self._key)
         log.info("DecryptFn ready (Fernet cipher initialised)")
-
+    
     def process_element(self, value: str, _):
         try:
             envelope = json.loads(value)
@@ -177,6 +177,7 @@ class BronzeMinioFn(MapFunction):
     fail the stream — a missing bronze object is preferable to
     dropping records from the main pipeline in a PoC context.
     """
+    
 
     def open(self, runtime_context) -> None:
         self._client = get_minio_client(
@@ -278,7 +279,6 @@ def main() -> None:
         TOPIC_PAYMENTS, TOPIC_DECRYPTED, TOPIC_DLQ,
     )
     env.execute("rt-payments-job1-decryption")
-
 
 if __name__ == "__main__":
     main()

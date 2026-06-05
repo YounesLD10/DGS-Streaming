@@ -62,6 +62,7 @@ from common.config import (
     TOPIC_DLQ,
     TOPIC_VALIDATED,
 )
+from common.iso_standards import is_valid_currency, is_valid_mti, luhn_check
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,6 +83,7 @@ def _non_empty(value) -> bool:
 def _validate_transaction(tx: dict) -> tuple[bool, str]:
     """Return (is_valid, reject_reason).
 
+    Applies 9 rules in order (rules ①–⑥ structural, ⑦–⑨ ISO standards).
     Reject reason uses the format RULE_CODE so downstream consumers
     can categorise failures without string parsing.
     """
@@ -118,6 +120,21 @@ def _validate_transaction(tx: dict) -> tuple[bool, str]:
     # ⑥ REJECT_CODE must be empty / absent
     if str(tx.get("REJECT_CODE", "")).strip():
         return False, "REJECTED_BY_BANK"
+
+    # ⑦ ISO 8583 — MTI must be a known message type
+    if msg_type and not is_valid_mti(msg_type):
+        return False, "ISO8583_UNKNOWN_MTI"
+
+    # ⑧ ISO 4217 — Currency must be in the dictionary
+    currency = str(tx.get("TRANSACTION_CURRENCY", "")).strip()
+    if currency and not is_valid_currency(currency):
+        return False, "ISO4217_INVALID_CURRENCY"
+
+    # ⑨ ISO 7812 — Luhn check on CARD_NUMBER
+    pan = str(tx.get("CARD_NUMBER", "")).replace("*", "").strip()
+    real_digits = [c for c in pan if c.isdigit()]
+    if len(real_digits) >= 12 and not luhn_check("".join(real_digits)):
+        return False, "ISO7812_LUHN_FAILED"
 
     return True, ""
 
