@@ -37,6 +37,12 @@ RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
 RUN mkdir -p /opt/flink/python-driver && \
     ln -sf /opt/flink/opt/flink-python-${FLINK_VERSION}.jar /opt/flink/python-driver/flink-python.jar
 
+# ── Prometheus metrics reporter ───────────────────────────────────────────
+# Not included in the base image — download from Maven into lib/ so the
+# JM and TM classpath picks it up at startup.
+RUN curl -fsSL -o /opt/flink/lib/flink-metrics-prometheus-${FLINK_VERSION}.jar \
+      https://repo1.maven.org/maven2/org/apache/flink/flink-metrics-prometheus/${FLINK_VERSION}/flink-metrics-prometheus-${FLINK_VERSION}.jar
+
 # ── flink-conf overrides for MinIO and Kubernetes service account ─────────
 RUN { \
       echo ""; \

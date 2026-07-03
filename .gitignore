@@ -19,7 +19,7 @@ k8s/
 scripts/
 
 # Local Fernet key (generated once, NEVER commit)
-
+.fernet_key
 
 # Local CSV data (PAN/PII — NEVER commit)
 data/

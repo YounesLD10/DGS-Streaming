@@ -60,6 +60,10 @@ DEBEZIUM_USER="${DEBEZIUM_USER:-debezium}"
 DEBEZIUM_PASSWORD="${DEBEZIUM_PASSWORD:-debezium}"
 DEBEZIUM_CONNECT_IMAGE="${DEBEZIUM_CONNECT_IMAGE:-quay.io/debezium/connect:2.7.0.Final}"
 
+# Monitoring — Prometheus + Grafana
+MONITORING_NAMESPACE="${MONITORING_NAMESPACE:-monitoring}"
+KUBE_PROMETHEUS_STACK_VERSION="61.3.2"
+
 # Vérification des prérequis 
 check_prerequisites() {
   step "Vérification des prérequis"
@@ -84,8 +88,8 @@ start_minikube() {
   if minikube status 2>/dev/null | grep -q "Running"; then
     if kubectl cluster-info &>/dev/null; then
       # Vérifier si la version K8s correspond à celle requise
-      CURRENT_K8S=$(kubectl version --short 2>/dev/null | grep "Server Version" | grep -oP 'v[\d.]+' || \
-                    kubectl version -o json 2>/dev/null | grep -o '"gitVersion":"v[^"]*"' | head -1 | grep -oP 'v[\d.]+' || echo "unknown")
+      CURRENT_K8S=$(kubectl version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion // empty' 2>/dev/null || echo "unknown")
+      [[ -z "$CURRENT_K8S" ]] && CURRENT_K8S="unknown"
       REQUIRED_K8S="${MINIKUBE_K8S_VERSION}"
       if [[ -n "$REQUIRED_K8S" && "$CURRENT_K8S" != "$REQUIRED_K8S" ]]; then
         warn "Version K8s incompatible : cluster=$CURRENT_K8S, requis=$REQUIRED_K8S"
@@ -300,7 +304,7 @@ resource "helm_release" "flink_operator" {
     value = "100m"
   }
 
-  timeout = 900
+  timeout = 1200
   wait    = true
 }
 
@@ -411,7 +415,7 @@ resource "helm_release" "minio" {
   }
 
   cleanup_on_fail = true
-  timeout = 600
+  timeout = 900
   wait    = true
 }
 
@@ -499,7 +503,54 @@ EOF
 
   # kafka-crd.tf — Kafka cluster + topics
   cat > "$S2/kafka-crd.tf" << 'EOF'
+# JMX Prometheus exporter config for Kafka broker metrics
+resource "kubernetes_config_map" "kafka_metrics" {
+  metadata {
+    name      = "kafka-metrics"
+    namespace = var.ingestion_namespace
+    labels    = { app = "strimzi" }
+  }
+  data = {
+    "kafka-metrics-config.yml" = <<-KAFKAYAML
+      lowercaseOutputName: true
+      rules:
+        - pattern: "kafka.server<type=(.+), name=(.+), clientId=(.+), topic=(.+), partition=(.*)><>Value"
+          name: kafka_server_$1_$2
+          type: GAUGE
+          labels:
+            clientId: "$3"
+            topic: "$4"
+            partition: "$5"
+        - pattern: "kafka.server<type=(.+), name=(.+), clientId=(.+), topic=(.+)><>Value"
+          name: kafka_server_$1_$2
+          type: GAUGE
+          labels:
+            clientId: "$3"
+            topic: "$4"
+        - pattern: "kafka.server<type=(.+), name=(.+)><>OneMinuteRate"
+          name: kafka_server_$1_$2
+          type: GAUGE
+        - pattern: "kafka.server<type=(.+), name=(.+)><>Value"
+          name: kafka_server_$1_$2
+          type: GAUGE
+        - pattern: "kafka.network<type=(.+), name=(.+)><>Value"
+          name: kafka_network_$1_$2
+          type: GAUGE
+        - pattern: "kafka.log<type=(.+), name=(.+), topic=(.+), partition=(.*)><>Value"
+          name: kafka_log_$1_$2
+          type: GAUGE
+          labels:
+            topic: "$3"
+            partition: "$4"
+        - pattern: "kafka.controller<type=(.+), name=(.+)><>Value"
+          name: kafka_controller_$1_$2
+          type: GAUGE
+      KAFKAYAML
+  }
+}
+
 resource "kubernetes_manifest" "kafka_cluster" {
+  depends_on = [kubernetes_config_map.kafka_metrics]
   manifest = {
     apiVersion = "kafka.strimzi.io/v1beta2"
     kind       = "Kafka"
@@ -527,6 +578,15 @@ resource "kubernetes_manifest" "kafka_cluster" {
         resources = {
           requests = { memory = "512Mi", cpu = "250m" }
           limits   = { memory = "1Gi",  cpu = "500m" }
+        }
+        metricsConfig = {
+          type = "jmxPrometheusExporter"
+          valueFrom = {
+            configMapKeyRef = {
+              name = "kafka-metrics"
+              key  = "kafka-metrics-config.yml"
+            }
+          }
         }
       }
       zookeeper = {
@@ -636,6 +696,10 @@ locals {
     "s3.path.style.access"                               = "true"
     "s3.access-key"                                      = var.minio_access_key
     "s3.secret-key"                                      = var.minio_secret_key
+    # Prometheus reporter — exposes metrics on port 9249 (scraped by PodMonitor)
+    "metrics.reporters"                                  = "prom"
+    "metrics.reporter.prom.factory.class"                = "org.apache.flink.metrics.prometheus.PrometheusReporterFactory"
+    "metrics.reporter.prom.port"                         = "9249"
   }
 }
 
@@ -673,6 +737,7 @@ resource "kubernetes_manifest" "flink_jobs" {
               },
               { name = "S3_BUCKET", value = var.minio_bucket },
             ]
+            ports = [{ name = "prometheus", containerPort = 9249 }]
           }]
         }
       }
@@ -756,6 +821,48 @@ spec:
               kubernetes.io/metadata.name: $FLINK_NAMESPACE
       ports:
         - port: 9000
+EOF
+
+  # NetworkPolicy : monitoring → all namespaces (Prometheus scraping)
+  cat > "$K8S_MANIFESTS_DIR/monitoring-network-policies.yaml" << EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: $KAFKA_NAMESPACE
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: $MONITORING_NAMESPACE
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: $FLINK_NAMESPACE
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: $MONITORING_NAMESPACE
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: $MINIO_NAMESPACE
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: $MONITORING_NAMESPACE
 EOF
 
   success "Manifests K8s générés dans $K8S_MANIFESTS_DIR"
@@ -1091,6 +1198,15 @@ ${CYAN}MinIO :${NC}
   # → http://localhost:9001  ($MINIO_ACCESS_KEY / $MINIO_SECRET_KEY)
   Bucket : $MINIO_BUCKET
 
+${CYAN}Grafana (monitoring) :${NC}
+  kubectl port-forward -n $MONITORING_NAMESPACE svc/kube-prometheus-stack-grafana 3000:80
+  # → http://localhost:3000  (admin / admin)
+  Dashboards : Kubernetes Cluster · Apache Flink Jobs · Kafka Exporter
+
+${CYAN}Prometheus :${NC}
+  kubectl port-forward -n $MONITORING_NAMESPACE svc/kube-prometheus-stack-prometheus 9090:9090
+  # → http://localhost:9090
+
 ${CYAN}Lancer le producer :${NC}
   ./setup_poc.sh produce <chemin/vers/csv> [rate=20] [limit=0]
 
@@ -1110,7 +1226,13 @@ teardown() {
   read -r -p "Confirmer la destruction ? (yes/no) : " confirm
   [[ "$confirm" == "yes" ]] || { log "Annulé."; exit 0; }
 
-  # 0. Nettoyage CDC (PostgreSQL + Debezium + job0) si déployés
+  # 0a. Nettoyage monitoring (Prometheus + Grafana + Kafka Exporter)
+  log "Désinstallation de la stack monitoring (si présente)..."
+  helm uninstall kube-prometheus-stack -n "$MONITORING_NAMESPACE" --ignore-not-found --wait --timeout 120s 2>/dev/null || true
+  helm uninstall kafka-exporter         -n "$MONITORING_NAMESPACE" --ignore-not-found --wait --timeout 60s  2>/dev/null || true
+  kubectl delete namespace "$MONITORING_NAMESPACE" --ignore-not-found 2>/dev/null || true
+
+  # 0b. Nettoyage CDC (PostgreSQL + Debezium + job0) si déployés
   log "Suppression des ressources CDC (si présentes)..."
   kubectl delete flinkdeployment job0-cdc-adapter -n "$FLINK_NAMESPACE" --ignore-not-found 2>/dev/null || true
   kubectl delete deployment postgresql debezium-connect -n "$PG_NAMESPACE" --ignore-not-found 2>/dev/null || true
@@ -1531,7 +1653,7 @@ EOF
   kubectl rollout status deployment/postgresql -n "$PG_NAMESPACE" --timeout=120s
 
   log "Attente Debezium Connect (rollout)..."
-  kubectl rollout status deployment/debezium-connect -n "$PG_NAMESPACE" --timeout=300s
+  kubectl rollout status deployment/debezium-connect -n "$PG_NAMESPACE" --timeout=600s
 
   # ── 5. Enregistrement du connecteur ─────────────────────────────────────
   register_debezium_connector
@@ -1723,6 +1845,482 @@ Variables :
 """
 }
 
+# ── Download dashboards from Grafana.com and import via API ──────────────────
+# Uses WSL's internet access (not minikube's, which has no outbound access).
+# Substitutes ${DS_PROMETHEUS} with the actual UID and sets allValue=".*".
+import_grafana_dashboards() {
+  log "Import des dashboards Grafana depuis grafana.com..."
+
+  # Kill any leftover port-forward on 3099 before starting a new one
+  pkill -f "port-forward.*3099" 2>/dev/null || true
+  sleep 2
+
+  kubectl wait --for=condition=ready pod -n "$MONITORING_NAMESPACE" \
+    -l "app.kubernetes.io/name=grafana" --timeout=180s >/dev/null 2>&1 || true
+
+  local PF_LOG
+  PF_LOG=$(mktemp)
+  kubectl port-forward -n "$MONITORING_NAMESPACE" \
+    svc/kube-prometheus-stack-grafana 3099:80 >"$PF_LOG" 2>&1 &
+  local PF_PID=$!
+  sleep 3  # let port-forward establish before first curl
+
+  local ready=false
+  for i in $(seq 1 15); do
+    if ! kill -0 "$PF_PID" 2>/dev/null; then
+      warn "Port-forward terminé prématurément: $(cat "$PF_LOG")"
+      rm -f "$PF_LOG"
+      warn "Grafana non prêt — import des dashboards ignoré"
+      return 0
+    fi
+    if curl -sf -u "admin:admin" "http://127.0.0.1:3099/api/health" 2>/dev/null | grep -q '"database"'; then
+      ready=true; break
+    fi
+    sleep 5
+  done
+  rm -f "$PF_LOG"
+
+  if ! $ready; then
+    kill "$PF_PID" 2>/dev/null
+    warn "Grafana non prêt — import des dashboards ignoré"
+    return 0
+  fi
+
+  python3 - <<'PYEOF'
+import json, sys, urllib.request, base64
+
+BASE = "http://127.0.0.1:3099"
+AUTH = base64.b64encode(b"admin:admin").decode()
+
+DASHBOARDS = [
+    {"name": "Kubernetes cluster monitoring", "gnetId": 315,   "revision": 3},
+    {"name": "Flink Dashboard",               "gnetId": 10369, "revision": 1},
+    {"name": "Kafka Exporter Overview",       "gnetId": 7589,  "revision": 5},
+]
+
+def api(path, method="GET", body=None):
+    req = urllib.request.Request(BASE + path, method=method)
+    req.add_header("Authorization", f"Basic {AUTH}")
+    req.add_header("Content-Type", "application/json")
+    if body:
+        req.data = json.dumps(body).encode()
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        print(f"  WARN {path}: {e}", file=sys.stderr)
+        return None
+
+def download(gnet_id, revision):
+    url = f"https://grafana.com/api/dashboards/{gnet_id}/revisions/{revision}/download"
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", "Mozilla/5.0")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+PROM_DS = {"type": "prometheus", "uid": "prometheus"}
+
+def is_prom_ds(v):
+    if isinstance(v, str):
+        return v.startswith("${DS_PROMETHEUS") or v in ("Prometheus", "prometheus")
+    if isinstance(v, dict):
+        uid = v.get("uid", "")
+        return uid.startswith("${DS_PROMETHEUS") or uid in ("prometheus", "Prometheus")
+    return False
+
+def fix_ds(obj):
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            if k == "datasource" and is_prom_ds(v):
+                result[k] = PROM_DS
+            else:
+                result[k] = fix_ds(v)
+        return result
+    if isinstance(obj, list):
+        return [fix_ds(i) for i in obj]
+    if isinstance(obj, str):
+        import re
+        return re.sub(r'\$\{DS_PROMETHEUS[^}]*\}', 'prometheus', obj)
+    return obj
+
+def patch_vars(dashboard):
+    for var in dashboard.get("templating", {}).get("list", []):
+        if var.get("type") == "query":
+            var["datasource"] = PROM_DS
+            var["includeAll"] = True
+            var["allValue"]   = ".*"
+            var["multi"]      = False
+            var["current"]    = {"selected": False, "text": "All", "value": "$__all"}
+    return dashboard
+
+folders = api("/api/folders") or []
+folder = next((f for f in folders if f.get("title") == "POC Pipeline"), None)
+if not folder:
+    folder = api("/api/folders", method="POST", body={"title": "POC Pipeline"})
+folder_id = folder["id"] if folder else 0
+
+for d in DASHBOARDS:
+    print(f"  Downloading {d['name']}...")
+    try:
+        dash = download(d["gnetId"], d["revision"])
+    except Exception as e:
+        print(f"  WARN download failed for {d['name']}: {e}", file=sys.stderr)
+        continue
+    dash.pop("id", None)
+    dash.pop("__inputs", None)
+    dash.pop("__requires", None)
+    dash = fix_ds(dash)
+    dash = patch_vars(dash)
+    result = api("/api/dashboards/db", method="POST", body={
+        "dashboard": dash,
+        "folderId":  folder_id,
+        "overwrite": True,
+    })
+    if result and result.get("status") == "success":
+        print(f"  Imported: {d['name']}")
+    else:
+        print(f"  WARN import failed for {d['name']}: {result}", file=sys.stderr)
+PYEOF
+
+  local rc=$?
+  kill "$PF_PID" 2>/dev/null
+  [ $rc -eq 0 ] && success "Dashboards Grafana importés" \
+                 || warn "Import partiel — vérifiez les WARNs ci-dessus"
+}
+
+# ── Patch Grafana dashboards: set all query-type template variables to "All" ─
+# Without this, every provisioned dashboard opens with "Job: None / Instance: None"
+# and shows no data until the user manually clicks each dropdown.
+# Strategy: open a temporary port-forward to Grafana and run the patch locally
+# (Python 3 is always available in WSL; the Grafana Alpine image has none).
+patch_grafana_dashboards() {
+  log "Patch des variables de template Grafana (All par défaut)..."
+
+  # Kill any leftover port-forward on 3099 before starting a new one
+  pkill -f "port-forward.*3099" 2>/dev/null || true
+  sleep 2
+
+  # Wait for Grafana pod to be Running (up to 3 min — pod restarts after helm upgrade)
+  kubectl wait --for=condition=ready pod -n "$MONITORING_NAMESPACE" \
+    -l "app.kubernetes.io/name=grafana" --timeout=180s >/dev/null 2>&1 || true
+
+  # Port-forward on 3099 to avoid colliding with the user's 3000 port-forward
+  local PF_LOG2
+  PF_LOG2=$(mktemp)
+  kubectl port-forward -n "$MONITORING_NAMESPACE" \
+    svc/kube-prometheus-stack-grafana 3099:80 >"$PF_LOG2" 2>&1 &
+  local PF_PID=$!
+  sleep 3  # let port-forward establish before first curl
+
+  # Wait for Grafana API to accept connections (up to 75 s)
+  local ready=false
+  for i in $(seq 1 15); do
+    if ! kill -0 "$PF_PID" 2>/dev/null; then
+      warn "Port-forward terminé prématurément: $(cat "$PF_LOG2")"
+      rm -f "$PF_LOG2"
+      warn "Grafana non prêt — variables à sélectionner manuellement dans l'UI"
+      return 0
+    fi
+    if curl -sf -u "admin:admin" "http://127.0.0.1:3099/api/health" 2>/dev/null | grep -q '"database"'; then
+      ready=true; break
+    fi
+    sleep 5
+  done
+  rm -f "$PF_LOG2"
+
+  if ! $ready; then
+    kill "$PF_PID" 2>/dev/null
+    warn "Grafana non prêt — variables à sélectionner manuellement dans l'UI"
+    return 0
+  fi
+
+  # Python 3 patch script — runs locally in WSL
+  python3 - <<'PYEOF'
+import json, sys, urllib.request
+
+BASE = "http://127.0.0.1:3099"
+AUTH = __import__("base64").b64encode(b"admin:admin").decode()
+
+def api(path, method="GET", body=None):
+    req = urllib.request.Request(BASE + path, method=method)
+    req.add_header("Authorization", f"Basic {AUTH}")
+    req.add_header("Content-Type", "application/json")
+    if body:
+        req.data = json.dumps(body).encode()
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        print(f"  WARN {path}: {e}", file=sys.stderr)
+        return None
+
+dashboards = api("/api/search?query=&limit=100") or []
+patched = 0
+
+for d in dashboards:
+    uid   = d.get("uid", "")
+    title = d.get("title", uid)
+    if not uid:
+        continue
+
+    resp      = api(f"/api/dashboards/uid/{uid}")
+    if not resp:
+        continue
+    dashboard = resp.get("dashboard", {})
+    folder_id = resp.get("meta", {}).get("folderId", 0)
+
+    changed = False
+    for var in dashboard.get("templating", {}).get("list", []):
+        if var.get("type") == "query":
+            var["includeAll"] = True
+            var["multi"]      = False
+            var["allValue"]   = ".*"
+            var["current"]    = {"selected": False, "text": "All", "value": "$__all"}
+            changed = True
+
+    if not changed:
+        continue
+
+    result = api("/api/dashboards/db", method="POST", body={
+        "dashboard": dashboard,
+        "folderId":  folder_id,
+        "overwrite": True,
+    })
+    if result and result.get("status") == "success":
+        print(f"  Patched: {title}")
+        patched += 1
+    else:
+        print(f"  WARN failed for '{title}': {result}", file=sys.stderr)
+
+print(f"Done — {patched} dashboard(s) patched.")
+PYEOF
+
+  local rc=$?
+  kill "$PF_PID" 2>/dev/null
+  if [ $rc -eq 0 ]; then
+    success "Variables de template Grafana configurées (All par défaut)"
+  else
+    warn "Patch Python échoué — sélectionnez 'All' dans les menus déroulants Grafana"
+  fi
+}
+
+# ── Déploie la stack Prometheus + Grafana dans le namespace monitoring ─────
+apply_monitoring() {
+  step "Déploiement monitoring : Prometheus + Grafana + Kafka Exporter"
+
+  # ── Namespace ──────────────────────────────────────────────────────────────
+  kubectl create namespace "$MONITORING_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl label namespace "$MONITORING_NAMESPACE" \
+    app.kubernetes.io/part-of=poc-pipeline --overwrite 2>/dev/null || true
+
+  # ── Réseau : autoriser Prometheus à scraper tous les namespaces du pipeline ─
+  kubectl apply -f - << EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: $KAFKA_NAMESPACE
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: $MONITORING_NAMESPACE
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: $FLINK_NAMESPACE
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: $MONITORING_NAMESPACE
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: $MINIO_NAMESPACE
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: $MONITORING_NAMESPACE
+EOF
+
+  # ── Helm repos ─────────────────────────────────────────────────────────────
+  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
+  helm repo update prometheus-community
+
+  # ── kube-prometheus-stack (Prometheus + Grafana + node-exporter + kube-state-metrics) ─
+  log "Installation de kube-prometheus-stack ${KUBE_PROMETHEUS_STACK_VERSION}..."
+  cat > /tmp/kps-values.yaml << 'VALUES'
+prometheus:
+  prometheusSpec:
+    retention: 24h
+    resources:
+      requests: { memory: "256Mi", cpu: "100m" }
+      limits:   { memory: "512Mi", cpu: "500m" }
+    # Discover ServiceMonitors and PodMonitors in ALL namespaces
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorNamespaceSelector: {}
+    serviceMonitorNamespaceSelector: {}
+    ruleSelectorNilUsesHelmValues: false
+    externalLabels:
+      cluster: minikube
+
+alertmanager:
+  enabled: false
+
+grafana:
+  adminPassword: admin
+  resources:
+    requests: { memory: "128Mi", cpu: "50m" }
+    limits:   { memory: "256Mi", cpu: "200m" }
+  sidecar:
+    dashboards:
+      enabled: true
+      searchNamespace: ALL
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: poc-pipeline
+          orgId: 1
+          folder: POC Pipeline
+          type: file
+          disableDeletion: false
+          editable: true
+          allowUiUpdates: true
+          options:
+            path: /var/lib/grafana/dashboards/poc-pipeline
+  # Dashboards are imported via the Grafana API (import_grafana_dashboards) below.
+  # The gnetId mechanism is not used because the in-cluster download from grafana.com
+  # fails in minikube (the init container has no outbound internet access).
+
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true
+
+# minikube uses self-signed certs on the kubelet — skip TLS verification
+# so Prometheus can scrape cAdvisor and node metrics
+kubelet:
+  enabled: true
+  serviceMonitor:
+    https: true
+    insecureSkipVerify: true
+    cAdvisor: true
+
+kubeProxy:
+  enabled: false
+
+kubeEtcd:
+  enabled: false
+
+kubeControllerManager:
+  enabled: false
+
+kubeScheduler:
+  enabled: false
+VALUES
+
+  helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+    --namespace "$MONITORING_NAMESPACE" \
+    --version  "$KUBE_PROMETHEUS_STACK_VERSION" \
+    --values   /tmp/kps-values.yaml \
+    --timeout  300s \
+    --wait
+  success "kube-prometheus-stack installé"
+
+  # ── Kafka Exporter (consumer-group lag per topic/partition) ───────────────
+  log "Installation de prometheus-kafka-exporter..."
+  helm upgrade --install kafka-exporter prometheus-community/prometheus-kafka-exporter \
+    --namespace "$MONITORING_NAMESPACE" \
+    --set "kafkaServer[0]=${KAFKA_CLUSTER_NAME}-kafka-bootstrap.${KAFKA_NAMESPACE}.svc:9092" \
+    --set resources.requests.memory=64Mi \
+    --set resources.requests.cpu=50m \
+    --set resources.limits.memory=128Mi \
+    --set resources.limits.cpu=100m \
+    --timeout 120s \
+    --wait
+  success "Kafka Exporter installé"
+
+  # Create ServiceMonitor manually — the Helm chart's serviceMonitor.enabled flag
+  # does not create a working ServiceMonitor in this chart version.
+  # Port name is "exporter-port" (not "metrics") — confirmed via `kubectl get svc`.
+  kubectl apply -f - << 'KAFKA_SM'
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kafka-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: prometheus-kafka-exporter
+      release: kafka-exporter
+  namespaceSelector:
+    matchNames:
+      - monitoring
+  endpoints:
+    - port: exporter-port
+      interval: 30s
+KAFKA_SM
+  success "ServiceMonitor Kafka Exporter créé"
+
+  # ── PodMonitor : Flink job metrics on port 9249 ───────────────────────────
+  # Flink operator labels pods with type=flink-native-kubernetes (not the FlinkDeployment labels)
+  kubectl apply -f - << 'FLINK_PM'
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: flink-jobs
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - traitement
+  selector:
+    matchLabels:
+      type: flink-native-kubernetes
+  podMetricsEndpoints:
+    - port: prometheus
+      path: /
+      interval: 15s
+FLINK_PM
+  success "PodMonitor Flink créé"
+
+  import_grafana_dashboards
+  patch_grafana_dashboards
+
+  MINIKUBE_IP=$(minikube ip 2>/dev/null || echo "<minikube-ip>")
+  echo -e "
+${GREEN}╔══════════════════════════════════════════════════════════╗
+║            Monitoring déployé avec succès                ║
+╚══════════════════════════════════════════════════════════╝${NC}
+
+${CYAN}Grafana :${NC}
+  kubectl port-forward -n $MONITORING_NAMESPACE svc/kube-prometheus-stack-grafana 3000:80
+  → http://localhost:3000  (admin / admin)
+  Dashboards : Kubernetes Cluster · Apache Flink · Kafka Exporter
+
+${CYAN}Prometheus :${NC}
+  kubectl port-forward -n $MONITORING_NAMESPACE svc/kube-prometheus-stack-prometheus 9090:9090
+  → http://localhost:9090
+"
+}
+
 main() {
   case "${1:-up}" in
     up)
@@ -1739,12 +2337,18 @@ main() {
       wait_for_components        # Kafka cluster Ready + MinIO rollout
       wait_for_jobs              # 4 FlinkDeployments STABLE
       apply_cdc                  # PostgreSQL + Debezium + job0 CDC adapter
+      apply_monitoring           # Prometheus + Grafana + Kafka Exporter
       print_summary
       ;;
     build)
       build_jobs_image
       ;;
     jobs)
+      apply_terraform_stage2
+      wait_for_jobs
+      ;;
+    regen-stage2)
+      generate_stage2_files
       apply_terraform_stage2
       wait_for_jobs
       ;;
@@ -1773,6 +2377,16 @@ main() {
     cdc)
       apply_cdc
       ;;
+    monitoring)
+      apply_monitoring
+      ;;
+    patch-grafana)
+      patch_grafana_dashboards
+      ;;
+    import-dashboards)
+      import_grafana_dashboards
+      patch_grafana_dashboards
+      ;;
     load-csv)
       shift
       load_csv "$@"
@@ -1785,6 +2399,9 @@ main() {
       kubectl get flinkdeployment -n "$FLINK_NAMESPACE"
       echo -e "\n${CYAN}=== Pods — stockage (MinIO) ===${NC}"
       kubectl get pods -n "$MINIO_NAMESPACE" -o wide
+
+      echo -e "\n${CYAN}=== Pods — monitoring (Prometheus / Grafana) ===${NC}"
+      kubectl get pods -n "$MONITORING_NAMESPACE" -o wide 2>/dev/null || warn "Namespace monitoring absent — lancer './setup_poc.sh monitoring'"
 
       echo -e "\n${CYAN}=== Pipeline — message counts per Kafka topic ===${NC}"
       for topic in cdc.public.powercard_operations payments.decrypted payments.validated payments.normalized payments.dlq; do
