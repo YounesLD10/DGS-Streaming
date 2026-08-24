@@ -65,6 +65,7 @@ from common.config import (
 )
 from common.crypto import Fernet, InvalidToken, fernet_decrypt, make_fernet
 from common.minio_sink import ensure_bucket, get_minio_client, write_record
+from common.kafka_utils import kafka_sink as _kafka_sink
 
 logging.basicConfig(
     level=logging.INFO,
@@ -196,21 +197,7 @@ class BronzeMinioFn(MapFunction):
         return value
 
 
-# ── KafkaSink factory ──────────────────────────────────────────────────────────
-
-def _kafka_sink(topic: str) -> KafkaSink:
-    return (
-        KafkaSink.builder()
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
-        .set_record_serializer(
-            KafkaRecordSerializationSchema.builder()
-            .set_topic(topic)
-            .set_value_serialization_schema(SimpleStringSchema())
-            .build()
-        )
-        .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE)
-        .build()
-    )
+# _kafka_sink is imported from common.kafka_utils (shared factory)
 
 
 # ── Job entry point ────────────────────────────────────────────────────────────

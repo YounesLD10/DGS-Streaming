@@ -1,0 +1,55 @@
+%%{init: {'theme': 'neutral'}}%%
+flowchart TD
+    IN(["Kafka topic\npayments\n(Fernet-encrypted JSON)"])
+
+    subgraph J1["Job 1 — rt-payments-job1-decryption"]
+        D1["DecryptFn\n(Fernet AES-128-CBC + HMAC-SHA256)\nInvalidToken handler"]
+        B1["BronzeMinioFn\nwrite-through to MinIO bronze/"]
+        D1 --> B1
+    end
+
+    OUT1(["payments.decrypted"])
+    DLQ(["payments.dlq\n(side output, 72h retention)"])
+
+    subgraph J2["Job 2 — rt-payments-job2-validation"]
+        V1["ValidateFn\nschema / field checks\nKeyedProcessFunction"]
+    end
+
+    OUT2(["payments.validated"])
+
+    subgraph J3["Job 3 — rt-payments-job3-normalization"]
+        N1["NormalizeFn\nfield normalisation,\nISO standards enrichment"]
+        S1["SilverMinioFn\nwrite-through to MinIO silver/"]
+        N1 --> S1
+    end
+
+    OUT3(["payments.normalized"])
+
+    subgraph J4["Job 4 — rt-payments-job4-optimization"]
+        O1["OptimizeFn\nrisk scoring, deduplication,\nMCC / channel enrichment"]
+        G1["GoldMinioFn\nwrite-through to MinIO gold/"]
+        O1 --> G1
+    end
+
+    OUT4(["payments.gold"])
+
+    IN --> D1
+    B1 -- "main output" --> OUT1
+    D1 -. "decrypt failure\nOutputTag(dlq-decrypt)" .-> DLQ
+
+    OUT1 --> V1
+    V1 -- "valid" --> OUT2
+    V1 -. "invalid\nOutputTag" .-> DLQ
+
+    OUT2 --> N1
+    S1 --> OUT3
+
+    OUT3 --> O1
+    G1 --> OUT4
+
+    classDef topic fill:#fde2e2,stroke:#c0392b,color:#000
+    classDef job fill:#e2ecfd,stroke:#2c5fa8,color:#000
+    classDef minio fill:#e6f4ea,stroke:#2e7d32,color:#000
+    class IN,OUT1,OUT2,OUT3,OUT4,DLQ topic
+    class D1,V1,N1,O1 job
+    class B1,S1,G1 minio

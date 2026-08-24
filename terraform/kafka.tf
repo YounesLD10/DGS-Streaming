@@ -29,13 +29,48 @@ resource "helm_release" "strimzi" {
     name  = "resources.limits.cpu"
     value = "500m"
   }
+  # Single-replica operator (no second pod to fail over to), so Lease-based
+  # leader election is pure overhead/risk here: under CPU/scheduling
+  # pressure on the minikube node, the operator periodically misses its
+  # lease renewal deadline, concludes it "stopped being a leader", and
+  # voluntarily exits (clean exitCode=1, immediately restarts and
+  # reacquires leadership) — this is what caused 137 cumulative restarts
+  # over 38 days with zero actual impact on cluster health. Disabling it
+  # removes the self-inflicted restart loop entirely.
+  set {
+    name  = "leaderElection.enable"
+    value = "false"
+  }
 }
 
 # ── KafkaNodePool + Kafka Cluster + Topics ─────────────────────────────────────
 # Uses null_resource + local-exec because kubernetes_manifest requires CRDs
 # to already exist at plan time, which they don't before Strimzi is installed.
+#
+# Taint safety (see incident: this resource was found tainted from a stale,
+# unresolved past provisioner failure, which would have made the next
+# unchecked `terraform apply` destroy and recreate the whole Kafka cluster):
+#   - The CREATE-time provisioner below is idempotent: every step is either
+#     a `kubectl apply` of an unchanged manifest (no-op against an already-
+#     healthy cluster, does NOT delete/recreate the Kafka resource or any
+#     KafkaTopic) or a wait-loop that exits immediately once already
+#     satisfied. Re-running it against a healthy cluster is safe.
+#   - Because of that, `on_failure = continue` is set: a transient failure
+#     in this script (e.g. a wait loop timing out under load) no longer
+#     taints the resource. Only a genuine triggers change (version bump)
+#     should ever cause a real replace.
+#   - The DESTROY-time provisioner (below) is NOT idempotent/safe — it
+#     deletes the live Kafka custom resource (and therefore all topics'
+#     data, since storage is ephemeral) and the node pool. `prevent_destroy`
+#     blocks this from running via taint-driven replace, trigger changes,
+#     or `terraform destroy` unless someone deliberately removes the
+#     lifecycle block first — a conscious, explicit decision.
 resource "null_resource" "kafka_cluster" {
   depends_on = [helm_release.strimzi]
+
+  lifecycle {
+    prevent_destroy = true
+  }
 
   triggers = {
     strimzi_version  = var.strimzi_version
@@ -44,6 +79,7 @@ resource "null_resource" "kafka_cluster" {
   }
 
   provisioner "local-exec" {
+    on_failure  = continue
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -euo pipefail
@@ -220,6 +256,19 @@ YAML
     EOT
   }
 
+  # DESTRUCTIVE — deletes the live Kafka custom resource (cascades to every
+  # topic's data, since storage.type is ephemeral) and the node pool. Only
+  # reachable via an explicit `terraform destroy` or a deliberate triggers
+  # change, now that `prevent_destroy` blocks taint-driven replacement.
+  # NOTE: the 6 KafkaTopics created by the create-time provisioner above
+  # (payments, payments.dlq, payments.decrypted, payments.validated,
+  # payments.normalized, payments.gold — plus payments.gold.flat, created
+  # separately outside this resource) are NOT individually tracked as
+  # Terraform resources/state — they're side effects of `kubectl apply`
+  # inside this null_resource's local-exec. There is nothing to attach a
+  # per-topic `prevent_destroy` to; their only protection is (a) this
+  # destroy path requiring a deliberate decision, and (b) the create path
+  # being a non-destructive `kubectl apply`, never a delete+recreate.
   provisioner "local-exec" {
     when        = destroy
     interpreter = ["/bin/bash", "-c"]

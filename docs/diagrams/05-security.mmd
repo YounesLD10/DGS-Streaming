@@ -1,0 +1,38 @@
+%%{init: {'theme': 'neutral'}}%%
+flowchart TD
+    subgraph ENC["Encryption in transit / at rest (Fernet = AES-128-CBC + HMAC-SHA256)"]
+        CSV[("Plaintext CSV\n(card number, amount, ...)")]
+        ENCRYPT["producer.py\nFernet.encrypt(record)\n+ wrap in CDC envelope"]
+        TOPIC(["Kafka topic: payments\n(ciphertext only)"])
+        DECRYPT["job1_decrypt.py\nFernet.decrypt(token)\nexplicit InvalidToken handler"]
+        CSV --> ENCRYPT --> TOPIC --> DECRYPT
+        DECRYPT -- "bad token / tampered" --> DLQ(["payments.dlq"])
+    end
+
+    subgraph NETPOL["Kubernetes NetworkPolicies (default-deny-ingress)"]
+        DENY["❌ default-deny-ingress\nblocks all ingress unless explicitly allowed"]
+        A1["✅ allow-flink-to-kafka\nflink namespace → kafka:9092"]
+        A2["✅ allow-flink-to-minio\nflink namespace → minio:9000"]
+        DENY -.-> A1
+        DENY -.-> A2
+    end
+
+    subgraph RBAC["RBAC for monitoring"]
+        SA["ServiceAccount: prometheus"]
+        CR["ClusterRole: pod/service discovery\n(get, list, watch)"]
+        CRB["ClusterRoleBinding"]
+        SA --> CRB --> CR
+    end
+
+    KEY[("FERNET_KEY\ninjected via env var\n(not committed to git)")]
+    KEY -.-> ENCRYPT
+    KEY -.-> DECRYPT
+
+    classDef crypto fill:#e2ecfd,stroke:#2c5fa8,color:#000
+    classDef policy fill:#fde2e2,stroke:#c0392b,color:#000
+    classDef rbac fill:#fff3cd,stroke:#a67c00,color:#000
+    classDef secret fill:#e6f4ea,stroke:#2e7d32,color:#000
+    class CSV,ENCRYPT,TOPIC,DECRYPT,DLQ crypto
+    class DENY,A1,A2 policy
+    class SA,CR,CRB rbac
+    class KEY secret

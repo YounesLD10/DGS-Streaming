@@ -1,0 +1,36 @@
+% ============================================================================
+% main.tex — Rapport de Projet de Fin d'Annee (5eme IIR)
+% Conception et Realisation d'un PoC de Streaming Temps Reel pour la
+% Detection de Fraude Bancaire
+% Asmae ABIDINE --- EMSI --- Annee universitaire 2025/2026
+%
+% Compiler avec XeLaTeX (deux passes pour les references croisees) :
+%   xelatex main.tex && xelatex main.tex
+% ============================================================================
+\documentclass[11pt,a4paper]{report}
+
+\input{preambule}
+
+\begin{document}
+
+% ---- Page de garde (sans en-tete, sans numero) -----------------------------
+\pagestyle{empty}
+\input{pageGarde}
+\pagestyle{fancy}
+
+% ---- Pages liminaires : numerotation romaine -------------------------------
+\pagenumbering{roman}
+\input{frontMatter}
+% frontMatter.tex bascule lui-meme en numerotation arabe (page 1) avant
+% l'introduction generale.
+
+% ---- Corps du rapport : 4 chapitres ----------------------------------------
+\input{chapitre1}
+\input{chapitre2}
+\input{chapitre3}
+\input{chapitre4}
+
+% ---- Back matter -----------------------------------------------------------
+\input{backMatter}
+
+\end{document}

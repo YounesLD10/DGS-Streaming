@@ -1,0 +1,29 @@
+%%{init: {'theme': 'neutral'}}%%
+flowchart LR
+    GOLD(["Kafka topic\npayments.gold\n(schemaless nested JSON)"])
+
+    subgraph ATTEMPT["Initial approach (abandoned)"]
+        DBZ["Kafka Connect +\nDebezium JDBC Sink connector"]
+        FAIL["❌ Incompatible:\nrequires Avro / Schema Registry—\npayments.gold has no schema"]
+        DBZ --> FAIL
+    end
+
+    subgraph FINAL["Final approach — namespace: kafka-connect"]
+        GS["gold-sink\n(custom Python Kafka consumer,\nDeployment)"]
+        MAP["Flatten nested 'transaction'\nsub-object → 18 flat columns"]
+        UPSERT["UPSERT ON CONFLICT\n(authorization_code) PRIMARY KEY"]
+        GS --> MAP --> UPSERT
+    end
+
+    PG[("PostgreSQL — postgres-datamart\nfact_transactions\n(transaction_amount, risk_score,\npayment_channel, card_scheme,\nmcc_description, ...)")]
+
+    GOLD -. "rejected: schema mismatch" .-> DBZ
+    GOLD --> GS
+    UPSERT --> PG
+
+    classDef bad fill:#fde2e2,stroke:#c0392b,color:#000
+    classDef good fill:#e6f4ea,stroke:#2e7d32,color:#000
+    classDef topic fill:#fff3cd,stroke:#a67c00,color:#000
+    class DBZ,FAIL bad
+    class GS,MAP,UPSERT,PG good
+    class GOLD topic

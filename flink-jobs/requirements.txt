@@ -1,7 +1,8 @@
-# HPS Real-Time Pipeline — Python dependencies
-# Install order matters: apache-flink first so its vendored JARs
-# are in place before the connector JARs are downloaded in the Dockerfile.
-
 apache-flink==1.19.1
 minio>=7.2.0
 cryptography>=41.0.0
+kafka-python==2.3.1
+# pinned: kafka-python 2.4.0 breaks KafkaConsumer with consumer_timeout_ms — see gold-sink
+psycopg2-binary>=2.9.0
+prometheus-client>=0.17.0
+pandas>=2.0.0

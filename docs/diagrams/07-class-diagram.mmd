@@ -1,0 +1,106 @@
+%%{init: {'theme': 'neutral'}}%%
+classDiagram
+    direction LR
+
+    class ProcessFunction {
+        <<PyFlink interface>>
+        +open(runtime_context)
+        +process_element(value, ctx)
+    }
+    class KeyedProcessFunction {
+        <<PyFlink interface>>
+        +open(runtime_context)
+        +process_element(value, ctx)
+    }
+    class MapFunction {
+        <<PyFlink interface>>
+        +open(runtime_context)
+        +map(value)
+    }
+
+    class DecryptFn {
+        -_key : str
+        -_fernet : Fernet
+        +open(runtime_context)
+        +process_element(value, ctx) str
+        ..emits to.. OutputTag("dlq-decrypt") on InvalidToken
+    }
+    class BronzeMinioFn {
+        -_client : Minio
+        +open(runtime_context)
+        +map(value) str
+    }
+    class ValidateFn {
+        +open(runtime_context)
+        +process_element(value, ctx) str
+        ..applies.. _validate_transaction() — 9 ordered rules
+    }
+    class NormalizeFn {
+        +open(runtime_context)
+        +process_element(value, ctx) str
+        ..applies.. _normalize_transaction(), _parse_date(), _parse_amount()
+    }
+    class SilverMinioFn {
+        -_client : Minio
+        +open(runtime_context)
+        +map(value) str
+    }
+    class OptimizeFn {
+        -_seen : ValueState~bool~
+        +open(runtime_context)
+        +process_element(value, ctx) str
+        ..applies.. _risk_score(), _payment_channel(), _extract_auth_code()
+    }
+    class GoldMinioFn {
+        -_client : Minio
+        +open(runtime_context)
+        +map(value) str
+    }
+
+    class CryptoUtils {
+        <<module: common.crypto>>
+        +make_fernet(key: str) Fernet
+        +fernet_decrypt(f: Fernet, token: str) str
+    }
+    class MinioSink {
+        <<module: common.minio_sink>>
+        +get_minio_client(endpoint, access_key, secret_key) Minio
+        +ensure_bucket(client, bucket)
+        +write_record(client, bucket, prefix, record) str
+    }
+    class IsoStandards {
+        <<module: common.iso_standards>>
+        +luhn_check(pan: str) bool
+        +is_valid_currency(code: str) bool
+        +is_valid_mti(mti: str) bool
+        +currency_alpha(code: str) str
+        +currency_minor_units(code: str) int
+        +mcc_description(mcc: str) str
+        +card_scheme(pan: str) str
+        +mask_pan(pan: str) str
+    }
+    class AppConfig {
+        <<module: common.config>>
+        +KAFKA_BOOTSTRAP : str
+        +TOPIC_PAYMENTS / DECRYPTED / VALIDATED / NORMALIZED / GOLD / DLQ : str
+        +MINIO_ENDPOINT / BUCKET / ACCESS_KEY / SECRET_KEY : str
+    }
+
+    ProcessFunction <|-- DecryptFn
+    ProcessFunction <|-- ValidateFn
+    ProcessFunction <|-- NormalizeFn
+    KeyedProcessFunction <|-- OptimizeFn
+    MapFunction <|-- BronzeMinioFn
+    MapFunction <|-- SilverMinioFn
+    MapFunction <|-- GoldMinioFn
+
+    DecryptFn ..> CryptoUtils : uses
+    ValidateFn ..> IsoStandards : uses (luhn_check, is_valid_mti, is_valid_currency)
+    NormalizeFn ..> IsoStandards : uses (card_scheme, mcc_description, currency_alpha)
+    BronzeMinioFn ..> MinioSink : uses
+    SilverMinioFn ..> MinioSink : uses
+    GoldMinioFn ..> MinioSink : uses
+    DecryptFn ..> AppConfig : reads config
+    ValidateFn ..> AppConfig : reads config
+    NormalizeFn ..> AppConfig : reads config
+    OptimizeFn ..> AppConfig : reads config

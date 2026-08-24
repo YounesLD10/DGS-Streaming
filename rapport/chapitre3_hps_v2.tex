@@ -1,0 +1,505 @@
+% ============================================================
+% CHAPITRE 3 : Étude Technique
+% Projet : Pipeline de Streaming Temps Réel --- HPS Group
+% Auteure : Asmae ABIDINE
+% ============================================================
+
+{\begin{center}\includegraphics[width=0.6\textwidth]{chapter3.png}\end{center}}
+
+\mysection{Chapitre 3}{Étude Technique}
+\vspace{0.5cm}
+\flushleft
+
+\subsection*{Introduction}
+\phantomsection
+\addcontentsline{toc}{subsection}{Introduction}
+\vspace{0.5cm}
+
+Ce chapitre a pour objectif de présenter en détail les aspects technologiques et architecturaux nécessaires à la réalisation de la plateforme de streaming temps réel pour HPS Group. Après avoir défini le périmètre fonctionnel et précisé les besoins conceptuels dans le chapitre précédent, il devient indispensable d'analyser et de sélectionner les technologies, les outils et les méthodologies les plus adaptés, afin de garantir la performance, la sécurité, l'évolutivité et la fiabilité du pipeline de traitement.
+\\[0.3cm]
+Cette étude s'intéresse particulièrement aux choix techniques relatifs à l'ingestion des données via Apache Kafka, au traitement en flux continu avec Apache Flink, au stockage objet distribué avec MinIO, ainsi qu'à l'orchestration de l'infrastructure avec Kubernetes et Terraform. Elle prend également en compte les aspects essentiels liés à la sécurité des données de paiement, à la conformité aux standards bancaires internationaux (ISO 8583, ISO 4217, ISO 7812), et à l'alimentation en temps réel du Data Mart PostgreSQL via Kafka Connect et Debezium.
+\\[0.3cm]
+L'objectif de ce chapitre est donc de fournir une base technique solide pour la phase de réalisation, en détaillant les architectures logicielles, les frameworks, les protocoles et les bonnes pratiques adoptés, tout en veillant à la compatibilité avec les exigences du système de paiement HPS SWAM et les contraintes d'un environnement Kubernetes local sur Minikube.
+
+\newpage
+
+% ============================================================
+\subsection{Architecture Globale du Système}
+\vspace{0.5cm}
+
+La plateforme de streaming temps réel HPS repose sur une architecture en pipeline, organisée en cinq couches fonctionnelles distinctes et interdépendantes. Cette organisation garantit une séparation claire des responsabilités, une forte cohésion interne de chaque composant et un faible couplage entre les couches, ce qui favorise la maintenabilité, la scalabilité et l'évolutivité du système.
+\\[0.3cm]
+L'architecture suit une logique de flux de données unidirectionnel, depuis la source PostgreSQL HPS jusqu'au Data Mart analytique, en passant par les quatre jobs de traitement Flink. Chaque couche est déployée dans un namespace Kubernetes dédié, isolé par des NetworkPolicies restrictives, garantissant que seules les communications autorisées sont permises entre les composants.
+\\[0.3cm]
+Le choix de cette architecture s'explique par la nature du projet et ses contraintes. En effet, le pipeline temps réel est destiné à compléter le traitement batch nocturne existant de HPS Group, en apportant une latence inférieure à 5 secondes pour la détection des fraudes et l'analyse des transactions. L'approche en couches offre un compromis idéal entre simplicité de déploiement sur Minikube et capacité de migration vers Azure Kubernetes Service (AKS) pour la production, sans modification du code applicatif.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=1.0\textwidth]{archiTechnique.png}
+  \caption{Architecture générale du pipeline de streaming temps réel HPS}
+  \label{fig:archiTechnique}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsection{Diagramme de Déploiement}
+\vspace{0.3cm}
+
+Le diagramme de déploiement illustre l'architecture physique de la plateforme déployée sur Minikube. Il modélise la répartition des composants dans les cinq namespaces Kubernetes dédiés et les communications réseau entre les pods.
+
+\vspace{0.3cm}
+\textbf{Description des n\oe uds}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{Machine hôte --- WSL2 Ubuntu 24.04} : Héberge les scripts \texttt{producer.py} et \texttt{hps\_exporter.py}, ainsi que les tunnels \texttt{kubectl port-forward} permettant l'accès local aux services Kubernetes.
+
+    \item \textbf{N\oe ud Minikube (6 CPU / 6 GB)} : Exécute l'intégralité de l'infrastructure Kubernetes répartie en cinq namespaces isolés :
+    \begin{itemize}
+        \item \texttt{kafka} : Strimzi Operator et Kafka Broker KRaft (\texttt{svc:9092})
+        \item \texttt{flink} : JobManager (\texttt{svc:8081/:9249}) et TaskManagers
+        \item \texttt{minio} : MinIO Server (\texttt{svc:9000/:9001})
+        \item \texttt{kafka-connect} : gold-sink consumer Python et PostgreSQL DataMart
+        \item \texttt{monitoring} : Prometheus (\texttt{svc:9090}) et Grafana (\texttt{svc:3000})
+    \end{itemize}
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Communications réseau}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item Les TaskManagers Flink consomment depuis Kafka (\texttt{:9092}) et écrivent dans MinIO (\texttt{:9000}).
+    \item Le consumer \texttt{gold-sink} lit \texttt{payments.gold} depuis Kafka et effectue des UPSERT dans PostgreSQL.
+    \item Prometheus scrape les métriques Flink sur \texttt{:9249} via découverte de pods Kubernetes (RBAC ClusterRole).
+    \item Grafana interroge Prometheus en PromQL pour alimenter le dashboard temps réel.
+    \item La machine hôte expose ses métriques métier sur \texttt{:8888} via \texttt{hps\_exporter.py}.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{deploiement.png}
+  \caption{Diagramme de déploiement --- Architecture Kubernetes du pipeline HPS}
+  \label{fig:deploiement}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsection{Environnement Technique}
+\vspace{0.3cm}
+
+\subsubsection{Architecture des Technologies Utilisées}
+\vspace{0.3cm}
+
+% ── KAFKA ────────────────────────────────────────────────────
+\paragraph{Apache Kafka (Strimzi 0.51.0 --- Mode KRaft)}
+\vspace{0.3cm}
+
+\subparagraph{Présentation}
+\vspace{0.1cm}
+Apache Kafka est un système de messagerie distribué conçu pour le streaming de données en temps réel à haute disponibilité et haute performance. Il est aujourd'hui le standard industriel pour les pipelines de données événementiels dans les systèmes financiers, grâce à sa durabilité, son ordre garanti et sa capacité de rejeu des messages. Dans la plateforme HPS, Kafka constitue l'épine dorsale du pipeline, assurant la transmission fiable des transactions de paiement entre les différents composants de traitement.
+
+\vspace{0.3cm}
+\subparagraph{Fonctionnement et Architecture}
+\vspace{0.1cm}
+Kafka organise les messages en topics partitionnés et répliqués. Chaque producteur publie des messages dans un topic, et chaque consommateur lit depuis un offset spécifique, permettant le rejeu des messages en cas de panne. Dans notre projet, Kafka est déployé via l'opérateur Strimzi sur Kubernetes, avec un broker en configuration dual-role (controller + broker). Six topics explicites sont créés via des ressources \texttt{KafkaTopic} Kubernetes, chacun avec une politique de rétention adaptée à son usage.
+
+\vspace{0.3cm}
+\subparagraph{KRaft Mode --- Innovation Architecturale}
+\vspace{0.1cm}
+KRaft (Kafka Raft) est le mode de gestion de métadonnées natif de Kafka 4.x, remplaçant ZooKeeper par un consensus Raft interne. Ce mode élimine la dépendance à un cluster ZooKeeper externe, simplifie l'architecture, réduit la latence de failover et constitue le standard depuis Kafka 4.x. Le choix du mode KRaft représente une avancée significative en termes de modernité et de robustesse par rapport aux déploiements ZooKeeper traditionnels encore utilisés dans certains projets comparables.
+
+\vspace{0.3cm}
+\subparagraph{Topics du Pipeline HPS}
+\vspace{0.1cm}
+Le pipeline HPS utilise six topics Kafka, chacun correspondant à une étape du traitement et configuré avec une rétention explicite garantissant la traçabilité et la disponibilité des données :
+
+\vspace{0.3cm}
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{|l|c|c|l|}
+\hline
+\textbf{Topic} & \textbf{Partitions} & \textbf{Rétention} & \textbf{Usage} \\
+\hline
+\texttt{payments}            & 3 & 24h     & Transactions chiffrées (entrée) \\
+\texttt{payments.decrypted}  & 3 & 24h     & Après décryption Fernet (Job 1) \\
+\texttt{payments.validated}  & 3 & 24h     & Après validation 9 règles (Job 2) \\
+\texttt{payments.normalized} & 3 & 24h     & Après normalisation ISO (Job 3) \\
+\texttt{payments.gold}       & 3 & 7 jours & Données enrichies finales (Job 4) \\
+\texttt{payments.dlq}        & 3 & 72h     & Dead Letter Queue (rejets) \\
+\hline
+\end{tabular}
+\caption{Topics Kafka du pipeline de streaming HPS}
+\label{tab:topics}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.35\textwidth]{kafka-logo.png}
+  \caption{Logo Apache Kafka}
+  \label{fig:kafkalogo}
+\end{figure}
+
+\newpage
+
+% ── FLINK ────────────────────────────────────────────────────
+\paragraph{Apache Flink 1.19.1 (PyFlink)}
+\vspace{0.3cm}
+
+\subparagraph{Présentation}
+\vspace{0.1cm}
+Apache Flink est un moteur de traitement de flux distribué conçu pour des applications stateful à haute performance et faible latence. Il se distingue des solutions micro-batch (comme Spark Streaming) par son modèle de traitement natif événement-par-événement, lui conférant une latence bien inférieure adaptée aux exigences temps réel des systèmes de paiement. Dans le pipeline HPS, Flink exécute les quatre jobs de traitement successifs, garantissant un traitement \texttt{EXACTLY\_ONCE} des transactions.
+
+\vspace{0.3cm}
+\subparagraph{Fonctionnement et Architecture}
+\vspace{0.1cm}
+Flink repose sur une architecture JobManager / TaskManager. Le JobManager orchestre le graphe d'exécution (DAG), gère les checkpoints et coordonne la récupération en cas de panne. Les TaskManagers exécutent les opérateurs du graphe en parallèle sur leurs slots de tâches. PyFlink, l'API Python officielle de Flink, permet d'écrire les jobs en Python tout en bénéficiant de toute la puissance du runtime Java sous-jacent. Dans notre projet, trois TaskManagers sont déployés avec deux slots chacun, offrant un parallélisme de 6 slots au total.
+
+\vspace{0.3cm}
+\subparagraph{Checkpointing EXACTLY\_ONCE --- Garantie de Fiabilité}
+\vspace{0.1cm}
+Le checkpointing \texttt{EXACTLY\_ONCE} est la configuration la plus robuste de Flink, garantissant que chaque enregistrement est traité exactement une fois, même en cas de panne et de redémarrage. Toutes les 30 secondes, Flink sauvegarde l'état de tous les opérateurs (offsets Kafka, états KeyedState) dans un snapshot cohérent. En cas de crash, le job redémarre depuis le dernier checkpoint sans perte ni duplication de données, ce qui est essentiel pour l'intégrité financière des transactions HPS.
+
+\vspace{0.3cm}
+\subparagraph{Architecture des Quatre Jobs Flink}
+\vspace{0.1cm}
+Les quatre jobs PyFlink implémentent un pipeline de traitement ETL complet :
+
+\begin{itemize}
+    \item \textbf{Job 1 --- Décryption} : déchiffrement Fernet, écriture Bronze MinIO, routage DLQ sur erreur.
+    \item \textbf{Job 2 --- Validation} : application de 9 règles (6 métier HPS + 3 ISO 8583/4217/7812), routage DLQ avec code de rejet machine-readable.
+    \item \textbf{Job 3 --- Normalisation} : conversion dates ISO 8601, normalisation montants, enrichissement card scheme / MCC / MTI name.
+    \item \textbf{Job 4 --- Optimisation} : déduplication \texttt{ValueState} par \texttt{AUTHORIZATION\_CODE}, scoring risque HIGH/MEDIUM/LOW, routage SO\_CARTE / SO\_MOBILE, publication \texttt{payments.gold}.
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.5\textwidth]{flink-logo.png}
+  \caption{Logo Apache Flink}
+  \label{fig:flinklogo}
+\end{figure}
+
+\newpage
+
+% ── MINIO ────────────────────────────────────────────────────
+\paragraph{MinIO --- Stockage Objet S3-Compatible}
+\vspace{0.3cm}
+
+\subparagraph{Présentation}
+\vspace{0.1cm}
+MinIO est un serveur de stockage objet open source entièrement compatible avec l'API Amazon S3. Il est conçu pour les environnements cloud-natifs et Kubernetes, offrant des performances élevées pour les workloads de données à grande échelle. Dans le pipeline HPS, MinIO constitue le data lake de la plateforme, hébergeant les trois couches de l'architecture Medallion dans le bucket \texttt{rt-payments}.
+
+\vspace{0.3cm}
+\subparagraph{Architecture Medallion Bronze / Silver / Gold}
+\vspace{0.1cm}
+L'architecture Medallion est un pattern de data lake structurant les données en trois couches de qualité croissante. Elle offre une traçabilité complète : en cas de bug dans la couche Gold, il est possible de reprocesser depuis Bronze sans réexécuter le producer. Chaque couche est indépendamment queryable via le SDK MinIO ou une interface S3 :
+
+\vspace{0.3cm}
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{|l|l|p{8cm}|}
+\hline
+\textbf{Couche} & \textbf{Chemin} & \textbf{Contenu} \\
+\hline
+\textbf{Bronze} & \texttt{bronze/} & Données brutes déchiffrées. Copie exacte après décryption. Aucune transformation. Écrites par Job 1. \\
+\hline
+\textbf{Silver} & \texttt{silver/} & Données validées et normalisées. Dates ISO 8601, montants float, enrichissements ISO. Écrites par Job 3. \\
+\hline
+\textbf{Gold}   & \texttt{gold/}  & Données dédupliquées et enrichies. Canal de paiement, score de risque. Prêtes pour analytics. Écrites par Job 4. \\
+\hline
+\end{tabular}
+\caption{Architecture Medallion Bronze / Silver / Gold dans MinIO}
+\label{tab:medallion}
+\end{table}
+
+\subparagraph{Compatibilité S3 et Portabilité}
+\vspace{0.1cm}
+La compatibilité S3 de MinIO est un atout majeur pour la portabilité du projet. Le même code Python utilisant le SDK \texttt{minio} fonctionne sans modification avec Amazon S3, Azure Blob Storage ou Google Cloud Storage. Cette portabilité garantit qu'aucun changement de code n'est nécessaire lors de la migration du PoC Minikube vers un environnement de production cloud, réduisant considérablement le risque et le coût de la transition.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.45\textwidth]{minio-logo.png}
+  \caption{Logo MinIO}
+  \label{fig:miniologo}
+\end{figure}
+
+\newpage
+
+% ── KUBERNETES + TERRAFORM ───────────────────────────────────
+\paragraph{Kubernetes (Minikube) et Terraform}
+\vspace{0.3cm}
+
+\subparagraph{Présentation}
+\vspace{0.1cm}
+Kubernetes est la plateforme d'orchestration de conteneurs standard de l'industrie, permettant de déployer, mettre à l'échelle et gérer des applications conteneurisées. Dans le cadre du PoC HPS, Minikube est utilisé pour exécuter un cluster Kubernetes local sur WSL2 Ubuntu 24.04. Terraform, l'outil d'Infrastructure as Code (IaC) de référence, provisionne l'ensemble de l'infrastructure de manière déclarative, garantissant la reproductibilité complète de l'environnement depuis un simple \texttt{terraform apply}.
+
+\vspace{0.3cm}
+\subparagraph{Infrastructure as Code --- Reproductibilité et Versioning}
+\vspace{0.1cm}
+L'intégralité de l'infrastructure est décrite dans des fichiers \texttt{.tf} versionnés sous Git : namespaces, ConfigMaps, Deployments, Services, KafkaTopics. Cette approche garantit que deux environnements créés à partir du même code Terraform sont identiques, éliminant les erreurs de configuration manuelle. Les fichiers Terraform sont organisés en modules distincts (\texttt{namespaces.tf}, \texttt{kafka.tf}, \texttt{flink.tf}, \texttt{minio.tf}), chacun gérant un composant spécifique de l'infrastructure.
+
+\vspace{0.3cm}
+\subparagraph{Isolation par Namespaces et NetworkPolicies}
+\vspace{0.1cm}
+L'infrastructure est organisée en quatre namespaces Kubernetes isolés, chacun dédié à un composant du pipeline. Des \texttt{NetworkPolicies} de type \textit{default-deny-ingress} sont appliquées sur chaque namespace, n'autorisant que les communications strictement nécessaires :
+
+\vspace{0.3cm}
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Namespace} & \textbf{Composants hébergés} \\
+\hline
+\texttt{kafka}         & Strimzi Operator, Kafka Broker KRaft, Entity Operator \\
+\texttt{flink}         & JobManager, TaskManagers (3 réplicas, 6 slots) \\
+\texttt{minio}         & MinIO Server, MinIO Console \\
+\texttt{kafka-connect} & Kafka Connect, Debezium, PostgreSQL HPS, Data Mart \\
+\hline
+\end{tabular}
+\caption{Namespaces Kubernetes du pipeline HPS}
+\label{tab:namespaces}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.65\textwidth]{kubernetes-terraform.png}
+  \caption{Kubernetes et Terraform --- Orchestration et Infrastructure as Code}
+  \label{fig:k8sterraform}
+\end{figure}
+
+\newpage
+
+% ── KAFKA CONNECT + DEBEZIUM ─────────────────────────────────
+\paragraph{Kafka Connect et Debezium CDC}
+\vspace{0.3cm}
+
+\subparagraph{Présentation}
+\vspace{0.1cm}
+Kafka Connect est le framework d'intégration de Kafka permettant de connecter des sources et des destinations de données sans développement de code spécifique. Debezium est un connecteur source Kafka Connect spécialisé dans le CDC (Change Data Capture), qui capture en temps réel les modifications d'une base de données relationnelle en lisant son journal de transactions (Write-Ahead Log). Ensemble, ils forment la couche d'ingestion automatique du pipeline HPS.
+
+\vspace{0.3cm}
+\subparagraph{Debezium CDC --- PostgreSQL vers Kafka}
+\vspace{0.1cm}
+Debezium se connecte à PostgreSQL en mode réplication logique (\texttt{wal\_level=logical}). Il crée un slot de réplication et une publication qui lui permettent de recevoir chaque INSERT, UPDATE et DELETE sur la table \texttt{transactions} en temps quasi-réel, avec une latence de l'ordre de la milliseconde. Cette approche est supérieure au polling SQL classique car elle détecte immédiatement toute modification sans interroger périodiquement la base, capture également les opérations DELETE, et évite toute charge inutile sur la base de données source.
+
+\vspace{0.3cm}
+\subparagraph{JDBC Sink Connector --- Kafka vers Data Mart}
+\vspace{0.1cm}
+Le connecteur JDBC Sink lit les messages enrichis du topic \texttt{payments.gold} et effectue des opérations UPSERT dans la table \texttt{fact\_transactions} du Data Mart PostgreSQL, en utilisant \texttt{authorization\_code} comme clé primaire. Cette alimentation en temps réel élimine le besoin de scripts ETL batch pour la mise à jour du Data Mart, garantissant que les analyses sont toujours basées sur les données les plus récentes.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.5\textwidth]{debezium-logo.png}
+  \caption{Logo Debezium --- Change Data Capture pour Kafka Connect}
+  \label{fig:debeziumlogo}
+\end{figure}
+
+\newpage
+
+% ── POSTGRESQL ───────────────────────────────────────────────
+\paragraph{PostgreSQL}
+\vspace{0.3cm}
+
+\subparagraph{Présentation}
+\vspace{0.1cm}
+PostgreSQL est un système de gestion de bases de données relationnelles open source largement reconnu pour sa stabilité, sa conformité aux standards SQL et ses fonctionnalités avancées. Utilisé dans de nombreux secteurs critiques, il est particulièrement adapté aux applications nécessitant une gestion fiable des transactions et une grande extensibilité. Dans le pipeline HPS, PostgreSQL est utilisé à deux niveaux : comme base source simulant le système HPS (pour Debezium CDC) et comme Data Mart analytique hébergeant le schéma en étoile.
+
+\vspace{0.3cm}
+\subparagraph{Fonctionnement et Architecture}
+\vspace{0.1cm}
+L'architecture de PostgreSQL est basée sur un modèle multi-processus : chaque connexion client est gérée par un processus serveur dédié, ce qui favorise le parallélisme et la résilience. Le moteur applique strictement le modèle ACID (Atomicité, Cohérence, Isolation, Durabilité), garantissant que les données restent cohérentes même en cas de panne. Le mécanisme de Write-Ahead Logging (WAL) journalise toutes les modifications avant leur application effective --- c'est précisément ce mécanisme que Debezium exploite pour le Change Data Capture en temps réel.
+
+\vspace{0.3cm}
+\subparagraph{Data Mart --- Schéma en Étoile}
+\vspace{0.1cm}
+Le Data Mart PostgreSQL implémente un schéma en étoile composé d'une table de faits centrale (\texttt{fact\_transactions}) et de quatre tables de dimensions (\texttt{dim\_risk}, \texttt{dim\_canal}, \texttt{dim\_banque}, \texttt{dim\_date}). Ce schéma optimise les requêtes analytiques sur les scores de risque, les canaux de paiement et les tendances temporelles. Deux vues analytiques pré-calculées (\texttt{v\_transactions\_risk} et \texttt{v\_risk\_summary}) facilitent les analyses métier sans nécessiter de jointures complexes.
+
+\subparagraph{Justification du Choix}
+\vspace{0.1cm}
+Le choix de PostgreSQL s'explique par plusieurs facteurs complémentaires. Sa prise en charge native de la réplication logique (\texttt{pgoutput}) est indispensable pour l'intégration avec Debezium. Sa compatibilité JDBC permet une connexion directe avec le connecteur Kafka Connect JDBC Sink. Son caractère open source garantit une indépendance vis-à-vis des éditeurs propriétaires, et sa maturité dans les environnements financiers critiques lui confère une crédibilité reconnue.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.4\textwidth]{postgresql-logo.png}
+  \caption{Logo PostgreSQL}
+  \label{fig:postgreslogo}
+\end{figure}
+
+\newpage
+
+% ── FERNET ───────────────────────────────────────────────────
+\paragraph{Chiffrement Fernet (AES-128-CBC + HMAC-SHA256)}
+\vspace{0.3cm}
+
+\subparagraph{Présentation}
+\vspace{0.1cm}
+Fernet est un schéma de chiffrement symétrique authentifié fourni par la bibliothèque Python \texttt{cryptography}. Il combine AES-128 en mode CBC pour le chiffrement des données et HMAC-SHA256 pour l'authentification du message. Dans le pipeline HPS, Fernet chiffre chaque payload de transaction avant publication dans Kafka, garantissant que les données financières sensibles ne sont jamais exposées en clair dans le bus de messages.
+
+\vspace{0.3cm}
+\subparagraph{Propriétés de Sécurité}
+\vspace{0.1cm}
+Fernet offre plusieurs propriétés de sécurité essentielles pour un système de paiement bancaire :
+\begin{itemize}
+    \item \textbf{Confidentialité} : AES-128-CBC avec IV aléatoire pour chaque token garantit que deux chiffrements du même texte produisent des tokens différents, éliminant les attaques par analyse fréquentielle.
+    \item \textbf{Intégrité} : HMAC-SHA256 détecte toute modification du ciphertext --- la moindre altération lève immédiatement une exception \texttt{InvalidToken}.
+    \item \textbf{Horodatage} : chaque token Fernet contient un timestamp permettant d'implémenter une expiration (TTL) optionnelle.
+    \item \textbf{Masquage PAN} : le numéro de carte est masqué (\texttt{123456******3456}) avant chiffrement, conformément à la norme PCI-DSS 3.4.
+\end{itemize}
+
+\vspace{0.3cm}
+\subparagraph{Pattern d'Initialisation dans open() --- Spécificité PyFlink}
+\vspace{0.1cm}
+L'objet Fernet est initialisé dans la méthode \texttt{open()} des opérateurs Flink, et non dans \texttt{\_\_init\_\_}. Cette distinction est fondamentale : Flink sérialise les opérateurs avec \texttt{pickle} pour les distribuer aux TaskManagers. L'objet Fernet n'est pas picklable, mais la clé (string) l'est. En l'initialisant dans \texttt{open()}, qui s'exécute après désérialisation sur le TaskManager, on évite l'erreur \texttt{PicklingError} tout en garantissant que chaque slot de tâche dispose de son propre objet Fernet indépendant.
+
+\newpage
+
+% ── PROMETHEUS + GRAFANA ─────────────────────────────────────
+\paragraph{Prometheus et Grafana --- Monitoring}
+\vspace{0.3cm}
+
+\subparagraph{Présentation}
+\vspace{0.1cm}
+Prometheus est un système de monitoring open source spécialisé dans la collecte et le stockage de métriques en séries temporelles. Il suit un modèle de scraping actif : il interroge périodiquement les endpoints \texttt{/metrics} exposés par les composants surveillés. Grafana est une plateforme de visualisation de données qui se connecte à Prometheus comme source de données et permet de créer des tableaux de bord interactifs. Ensemble, ils constituent la couche d'observabilité du pipeline HPS.
+
+\vspace{0.3cm}
+\subparagraph{Métriques Collectées}
+\vspace{0.1cm}
+Le stack de monitoring collecte les métriques critiques de chaque composant du pipeline :
+\begin{itemize}
+    \item \textbf{Flink} : nombre de jobs en cours (\texttt{flink\_jobmanager\_numRunningJobs}), durée des checkpoints, backpressure par opérateur, records traités par seconde.
+    \item \textbf{Kafka} : lag des consommateurs par topic, nombre de messages entrants, taux d'erreurs DLQ.
+    \item \textbf{MinIO} : nombre d'objets par couche (Bronze/Silver/Gold), espace utilisé.
+    \item \textbf{Kafka Connect} : statut des connecteurs (Debezium Source, JDBC Sink), latence CDC.
+\end{itemize}
+
+\vspace{0.3cm}
+\subparagraph{Dashboard HPS Pipeline}
+\vspace{0.1cm}
+Un tableau de bord Grafana dédié au pipeline HPS est provisionné automatiquement, offrant une vue en temps réel de la santé du système. Il permet de détecter immédiatement tout problème : un job Flink en échec, un consumer lag anormal sur le topic \texttt{payments.gold}, ou une accumulation excessive de messages dans la DLQ. Cette observabilité est essentielle pour garantir le respect du SLA de latence inférieure à 5 secondes.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.7\textwidth]{prometheus-grafana.png}
+  \caption{Prometheus et Grafana --- Stack de monitoring du pipeline HPS}
+  \label{fig:prometheuslogo}
+\end{figure}
+
+\newpage
+
+% ── PYTHON ───────────────────────────────────────────────────
+\paragraph{Python 3.12 et PyFlink}
+\vspace{0.3cm}
+
+\subparagraph{Présentation}
+\vspace{0.1cm}
+Python est le langage de programmation dominant dans l'écosystème data engineering, grâce à sa richesse en bibliothèques spécialisées, sa lisibilité et sa productivité. Dans le pipeline HPS, Python 3.12 est utilisé pour écrire les quatre jobs Flink via PyFlink, les scripts de production CSV, le consumer Python du Data Mart, et le module commun (\texttt{common/}) regroupant la configuration, le chiffrement, le client MinIO et les standards ISO bancaires.
+
+\vspace{0.3cm}
+\subparagraph{Module Commun --- Standards ISO Bancaires}
+\vspace{0.1cm}
+Le module \texttt{common/iso\_standards.py} implémente trois standards bancaires internationaux utilisés dans le Job 2 (validation) et le Job 3 (enrichissement) :
+\begin{itemize}
+    \item \textbf{ISO 8583} : dictionnaire des 15 MTI Powercard reconnus (ex. : \texttt{1100} = Authorization Request).
+    \item \textbf{ISO 4217} : dictionnaire de 23 codes de devise (ex. : \texttt{504} = MAD, \texttt{840} = USD, \texttt{978} = EUR).
+    \item \textbf{ISO 7812} : algorithme de Luhn (mod-10) pour la validation des numéros de carte bancaire.
+\end{itemize}
+
+\vspace{0.3cm}
+\subparagraph{Justification du Choix}
+\vspace{0.1cm}
+Le choix de Python pour les jobs Flink s'explique par la disponibilité de l'API PyFlink officielle d'Apache Flink, qui offre une interface Python complète tout en s'exécutant sur le runtime Java performant. Les bibliothèques \texttt{cryptography} (Fernet), \texttt{minio} (client S3) et \texttt{kafka-python} (producer) sont des références dans leurs domaines respectifs, bénéficiant d'une large communauté et d'une maintenance active.
+
+\newpage
+
+% ============================================================
+\subsection{Outils et Environnement de Développement}
+\vspace{0.3cm}
+
+\subsubsection{Environnement de Développement Local}
+\vspace{0.3cm}
+
+\paragraph{WSL2 Ubuntu 24.04}
+\vspace{0.3cm}
+L'environnement de développement local repose sur WSL2 (Windows Subsystem for Linux 2) avec Ubuntu 24.04 LTS. WSL2 offre un noyau Linux complet sur Windows, permettant d'exécuter Minikube avec le driver Docker sans machine virtuelle dédiée séparée. L'intégration avec Docker Desktop assure que les images construites dans le daemon Minikube sont immédiatement disponibles pour les déploiements Kubernetes, sans nécessiter de push vers un registry externe.
+
+\vspace{0.3cm}
+\paragraph{Image Docker Personnalisée \texttt{hps-flink:1.0}}
+\vspace{0.3cm}
+Une image Docker personnalisée est construite sur la base de \texttt{apache/flink:1.19.1-scala\_2.12-java11}, en y intégrant l'ensemble des dépendances nécessaires au pipeline HPS :
+\begin{itemize}
+    \item Python 3.12 et PyFlink 1.19.1 installés via pip
+    \item \texttt{flink-connector-kafka-3.2.0-1.19.jar} --- connecteur Kafka pour Flink
+    \item \texttt{kafka-clients-3.4.0.jar} --- client Kafka (requis pour éviter \texttt{NoClassDefFoundError})
+    \item Bibliothèques Python : \texttt{minio}, \texttt{cryptography}
+    \item Les fichiers de jobs dans \texttt{/opt/jobs/} avec \texttt{PYTHONPATH=/opt/jobs}
+\end{itemize}
+
+\vspace{0.3cm}
+\paragraph{Strimzi Operator 0.51.0}
+\vspace{0.3cm}
+Strimzi est l'opérateur Kubernetes officiel pour Apache Kafka. Il étend Kubernetes avec des Custom Resource Definitions (CRDs) permettant de décrire un cluster Kafka, des topics et des utilisateurs comme des ressources Kubernetes natives. Dans le pipeline HPS, Strimzi gère le cycle de vie complet du cluster Kafka, depuis la création des brokers jusqu'à la gestion des topics avec leurs configurations de rétention. Le déploiement via Helm garantit la reproductibilité de l'installation.
+
+\subsubsection{Outils de Développement et Déploiement}
+\vspace{0.3cm}
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{|l|l|p{8cm}|}
+\hline
+\textbf{Outil} & \textbf{Version} & \textbf{Rôle dans le projet} \\
+\hline
+Minikube     & $\geq$ 1.30   & Cluster Kubernetes local sur Docker/WSL2 (6 CPUs, 6 GB RAM) \\
+kubectl      & $\geq$ 1.28   & CLI Kubernetes pour la gestion des pods et services \\
+Helm         & $\geq$ 3.12   & Gestionnaire de packages K8s (Strimzi, MinIO) \\
+Terraform    & $\geq$ 1.0    & Infrastructure as Code --- provisionne toutes les ressources K8s \\
+Docker       & $\geq$ 24.0   & Moteur de conteneurs --- build de l'image \texttt{hps-flink:1.0} \\
+Python       & 3.12          & Langage des jobs Flink, scripts producer et consumer \\
+\hline
+\end{tabular}
+\caption{Outils de déploiement et d'orchestration du pipeline HPS}
+\label{tab:outils}
+\end{table}
+
+\subsubsection{Bibliothèques Python}
+\vspace{0.3cm}
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{|l|l|p{9cm}|}
+\hline
+\textbf{Bibliothèque} & \textbf{Version} & \textbf{Rôle} \\
+\hline
+\texttt{apache-flink}   & 1.19.1        & API PyFlink pour les 4 jobs de streaming \\
+\texttt{cryptography}   & $\geq$ 41.0   & Chiffrement Fernet (AES-128-CBC + HMAC-SHA256) \\
+\texttt{minio}          & $\geq$ 7.2    & Client SDK MinIO/S3 pour l'écriture Medallion \\
+\texttt{kafka-python}   & $\geq$ 2.0    & Producer Python pour l'ingestion CSV \\
+\texttt{pandas}         & $\geq$ 2.0    & Lecture des fichiers CSV HPS SWAM (1000 lignes) \\
+\texttt{psycopg2}       & $\geq$ 2.9    & Connecteur PostgreSQL pour le Data Mart consumer \\
+\hline
+\end{tabular}
+\caption{Bibliothèques Python utilisées dans le pipeline HPS}
+\label{tab:libs}
+\end{table}
+
+\newpage
+
+% ============================================================
+\subsection*{Conclusion}
+\phantomsection
+\addcontentsline{toc}{subsection}{Conclusion}
+\vspace{0.5cm}
+
+Ce chapitre a permis de présenter l'ensemble des choix techniques qui fondent la plateforme de streaming temps réel développée pour HPS Group. L'étude technique a mis en évidence une stack technologique cohérente et moderne, où chaque composant répond à un besoin précis du pipeline de traitement.
+\\[0.3cm]
+Apache Kafka en mode KRaft assure la durabilité et la rejouabilité des messages de transaction, éliminant la dépendance à ZooKeeper grâce au consensus Raft natif de Kafka 4.x. Apache Flink 1.19.1 avec PyFlink garantit un traitement \texttt{EXACTLY\_ONCE} des transactions, avec déduplication par \texttt{KeyedState} et scoring de risque métier, offrant des garanties bien supérieures aux solutions \texttt{AT\_LEAST\_ONCE}. MinIO implémente l'architecture Medallion Bronze/Silver/Gold, assurant une traçabilité complète et la possibilité de reprocesser depuis n'importe quelle couche en cas d'anomalie.
+\\[0.3cm]
+L'Infrastructure as Code via Terraform garantit la reproductibilité intégrale de l'environnement depuis un simple \texttt{terraform apply}, tandis que les NetworkPolicies Kubernetes assurent l'isolation réseau entre les composants. Les standards bancaires ISO 8583, ISO 4217 et ISO 7812 sont implémentés nativement dans le Job 2, garantissant la conformité réglementaire de chaque transaction traitée.
+\\[0.3cm]
+L'intégration de Kafka Connect avec Debezium CDC et le connecteur JDBC Sink complète le pipeline en alimentant automatiquement le Data Mart PostgreSQL en temps réel, ouvrant la voie aux analyses métier immédiates. Enfin, le stack de monitoring Prometheus et Grafana assure l'observabilité complète du pipeline, permettant de détecter et corriger rapidement tout incident. Ces choix techniques constituent le socle sur lequel s'appuie la réalisation détaillée dans le chapitre suivant. Le diagramme de déploiement présenté dans ce chapitre illustre concrètement la répartition de ces composants sur l'architecture Kubernetes Minikube, avec ses cinq namespaces isolés et ses NetworkPolicies restrictives.
+
+\newpage

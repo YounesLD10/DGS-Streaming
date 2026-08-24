@@ -1,0 +1,57 @@
+%%{init: {'theme': 'neutral'}}%%
+flowchart TB
+    subgraph HOST["Host machine — WSL2 Ubuntu 24.04"]
+        DEV["Developer workstation\nproducer.py · hps_exporter.py\nkubectl port-forward tunnels"]
+    end
+
+    subgraph MINIKUBE["Minikube node (Docker driver, 6 CPU / 6144 MB)"]
+
+        subgraph NS_KAFKA["namespace: kafka"]
+            STRIMZI["Pod: strimzi-cluster-operator\n(v0.51.0)"]
+            BROKER["Pod: hps-cluster-dual-role-0\nKafka 4.1.0 (KRaft, controller+broker)\nsvc :9092"]
+            EO["Pod: entity-operator\n(topic / user operator)"]
+        end
+
+        subgraph NS_FLINK["namespace: flink"]
+            JM["Deployment: flink-jobmanager\nsvc :8081 (UI/REST), :9249 (metrics)"]
+            TM["Deployment: flink-taskmanager\n2 slots · svc :9249 (metrics)"]
+        end
+
+        subgraph NS_MINIO["namespace: minio"]
+            MINIO["Deployment: minio\nbucket rt-payments\nsvc :9000 (S3 API), :9001 (console)"]
+        end
+
+        subgraph NS_KC["namespace: kafka-connect"]
+            GS["Deployment: gold-sink\n(custom Python consumer)"]
+            PG["StatefulSet: postgres-datamart\n(emptyDir — non-persistent)\nsvc :5432"]
+        end
+
+        subgraph NS_MON["namespace: monitoring"]
+            PROM["Deployment: prometheus\nServiceAccount + ClusterRole\n(pod discovery RBAC) · svc :9090"]
+            GRAF["Deployment: grafana\nsvc :3000"]
+        end
+    end
+
+    DEV -- "port-forward 9094→9092" --> BROKER
+    DEV -- "port-forward 9000" --> MINIO
+    DEV -- "port-forward 5433→5432" --> PG
+    DEV -- "port-forward 9090 / 3000 / 8081" --> PROM
+    DEV -- "exposes :8888/metrics\n(reached via 10.255.255.254)" --> PROM
+
+    STRIMZI -.manages.-> BROKER
+    STRIMZI -.manages.-> EO
+    JM <--> TM
+    TM -- ":9092" --> BROKER
+    TM -- ":9000" --> MINIO
+    GS -- "consumes payments.gold" --> BROKER
+    GS -- "UPSERT" --> PG
+    PROM -- "scrape :9249" --> JM
+    PROM -- "scrape :9249 (pod discovery)" --> TM
+    PROM -- "scrape /minio/v2/metrics/cluster" --> MINIO
+    GRAF -- "PromQL :9090" --> PROM
+
+    classDef ns fill:#f5f5f5,stroke:#999,color:#000
+    classDef pod fill:#e2ecfd,stroke:#2c5fa8,color:#000
+    classDef host fill:#fff3cd,stroke:#a67c00,color:#000
+    class DEV host
+    class STRIMZI,BROKER,EO,JM,TM,MINIO,GS,PG,PROM,GRAF pod

@@ -8,4 +8,7 @@ __pycache__/
 *.pyc
 .env
 .venv/
+.runtime/
 data/
+*.tfplan
+*.tfvars

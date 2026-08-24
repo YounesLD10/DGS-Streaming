@@ -11,9 +11,10 @@ Process : KeyedStream by AUTHORIZATION_CODE
                PRODUCT_CODE = "6" -> payment_channel = "SO_CARTE"
                anything else      -> payment_channel = "SO_MOBILE"
             3. Risk scoring
-               HIGH   : REJECT_CODE was filled  OR  TRANSACTION_AMOUNT > 10_000
-               MEDIUM : MATCHING_STATUS not in {U, I, L}  OR  AMOUNT == 0
+               HIGH   : TRANSACTION_AMOUNT > 10_000
+               MEDIUM : MATCHING_STATUS not in {U, I, L}
                LOW    : all checks pass
+               (REJECT_CODE and AMOUNT==0 branches removed — dead code filtered by Job2)
             4. Add fields: payment_channel, risk_score, optimized_at (UTC ISO 8601)
 Sink    : MinIO  rt-payments/gold/   (GoldMinioFn MapFunction + .print() terminal)
 
@@ -61,10 +62,7 @@ from pyflink.datastream import (
     StreamExecutionEnvironment,
 )
 from pyflink.datastream.connectors.kafka import (
-    DeliveryGuarantee,
     KafkaOffsetsInitializer,
-    KafkaRecordSerializationSchema,
-    KafkaSink,
     KafkaSource,
 )
 from pyflink.datastream.functions import KeyedProcessFunction, MapFunction
@@ -81,6 +79,7 @@ from common.config import (
     TOPIC_NORMALIZED,
 )
 from common.minio_sink import ensure_bucket, get_minio_client, write_record
+from common.kafka_utils import kafka_sink as _kafka_sink
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,6 +106,27 @@ def _extract_auth_code(value: str) -> str:
         return _UNKNOWN_KEY
 
 
+def _extract_dedup_key(value: str) -> str:
+    """Return composite dedup key '{auth_code}|{mti}' for PyFlink key_by.
+
+    Using a composite key of AUTHORIZATION_CODE + message_type (raw MTI) ensures
+    that reversal MTIs (1420 = Reversal Request, 1421 = Reversal Repeat,
+    1430 = Reversal Advice) reuse the original authorization_code but get their
+    own dedup partition — they must not be dropped as duplicates of the original
+    authorization.
+    """
+    try:
+        record = json.loads(value)
+        tx = record.get("transaction", record)
+        auth_code = str(tx.get("AUTHORIZATION_CODE", "")).strip()
+        mti       = str(tx.get("MESSAGE_TYPE", "")).strip()
+        if not auth_code:
+            return _UNKNOWN_KEY
+        return f"{auth_code}|{mti}"
+    except Exception:
+        return _UNKNOWN_KEY
+
+
 # ── Business logic helpers ─────────────────────────────────────────────────────
 
 def _payment_channel(tx: dict) -> str:
@@ -114,18 +134,24 @@ def _payment_channel(tx: dict) -> str:
 
 
 def _risk_score(tx: dict) -> str:
-    """Three-tier risk score evaluated HIGH -> MEDIUM -> LOW."""
-    reject_code = str(tx.get("REJECT_CODE", "")).strip()
-    matching    = str(tx.get("MATCHING_STATUS", "")).strip()
+    """Three-tier risk score evaluated HIGH -> MEDIUM -> LOW.
+
+    Dead branches removed:
+    - reject_code non-empty: Job2 Rule ⑥ already filters records with a
+      non-empty REJECT_CODE; they never reach Job4.
+    - amount == 0: Job2 Rule ② rejects transactions with amount <= 0;
+      zero-amount records are routed to the DLQ before reaching Job4.
+    """
+    matching = str(tx.get("MATCHING_STATUS", "")).strip()
 
     try:
         amount = float(str(tx.get("TRANSACTION_AMOUNT", 0)).replace(",", "."))
     except (ValueError, TypeError):
         amount = 0.0
 
-    if reject_code or amount > 10_000:
+    if amount > 10_000:
         return "HIGH"
-    if matching not in _VALID_MATCHING_STATUSES or amount == 0:
+    if matching not in _VALID_MATCHING_STATUSES:
         return "MEDIUM"
     return "LOW"
 
@@ -145,15 +171,17 @@ class OptimizeFn(KeyedProcessFunction):
 
     def open(self, runtime_context) -> None:
         self._seen = runtime_context.get_state(
-            ValueStateDescriptor("seen", Types.BOOLEAN())
+            ValueStateDescriptor("seen-auth-mti", Types.BOOLEAN())
         )
-        log.info("OptimizeFn ready (ValueState initialised)")
+        log.info("OptimizeFn ready (ValueState initialised, composite auth|mti key)")
 
     def process_element(self, value: str, ctx: KeyedProcessFunction.Context):
         current_key = ctx.get_current_key()
 
         # Records keyed __UNKNOWN__ are not deduplicated against each other
-        # because they lack a real business key.
+        # because they lack a real business key. All other records are keyed by
+        # composite auth_code|mti so reversals (MTI 1420/1421/1430) sharing the
+        # same auth_code get their own partition and pass dedup.
         if current_key != _UNKNOWN_KEY and self._seen.value():
             log.debug("Duplicate AUTHORIZATION_CODE=%s - skipped", current_key)
             return
@@ -209,21 +237,7 @@ class GoldMinioFn(MapFunction):
         return value
 
 
-# ── KafkaSink factory ──────────────────────────────────────────────────────────
-
-def _kafka_sink(topic: str) -> KafkaSink:
-    return (
-        KafkaSink.builder()
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
-        .set_record_serializer(
-            KafkaRecordSerializationSchema.builder()
-            .set_topic(topic)
-            .set_value_serialization_schema(SimpleStringSchema())
-            .build()
-        )
-        .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE)
-        .build()
-    )
+# _kafka_sink is imported from common.kafka_utils (shared factory)
 
 
 # ── Job entry point ────────────────────────────────────────────────────────────
@@ -253,8 +267,10 @@ def main() -> None:
         "payments-normalized-source",
     )
 
-    # Key by AUTHORIZATION_CODE for stateful deduplication
-    keyed = raw.key_by(_extract_auth_code, key_type=Types.STRING())
+    # Key by composite AUTHORIZATION_CODE|MTI for stateful deduplication.
+    # Using _extract_dedup_key (not _extract_auth_code) so that reversal MTIs
+    # (1420, 1421, 1430) sharing the same auth_code get their own key partition.
+    keyed = raw.key_by(_extract_dedup_key, key_type=Types.STRING())
 
     processed = (
         keyed

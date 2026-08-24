@@ -1,5 +1,5 @@
 """
-Environment-driven configuration for all HPS pipeline jobs.
+Environment-driven configuration for all SWAM pipeline jobs.
 All values come from env vars; defaults point to in-cluster endpoints.
 No secrets are hardcoded — FERNET_KEY has no default and the job
 validates its presence at startup.
@@ -15,7 +15,8 @@ KAFKA_BOOTSTRAP: str = os.getenv(
 # ── MinIO ──────────────────────────────────────────────────────────────────────
 MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "http://minio.minio.svc:9000")
 MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "admin")
-MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "admin123")
+# Populated from minio-credentials K8s Secret (MINIO_SECRET_KEY env var) — no hardcoded default
+MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "")
 MINIO_BUCKET: str = os.getenv("MINIO_BUCKET", "rt-payments")
 
 # ── Cryptography ───────────────────────────────────────────────────────────────
@@ -26,7 +27,7 @@ FERNET_KEY: str = os.getenv("FERNET_KEY", "")
 CHECKPOINT_INTERVAL_MS: int = int(os.getenv("CHECKPOINT_INTERVAL_MS", "30000"))
 
 # ── Pipeline metadata ──────────────────────────────────────────────────────────
-SOURCE_SYSTEM: str = "HPS_SWAM"
+SOURCE_SYSTEM: str = "SWAM"
 PIPELINE_VERSION: str = "1.0.0"
 
 # ── Kafka topic names ──────────────────────────────────────────────────────────

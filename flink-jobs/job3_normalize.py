@@ -42,13 +42,11 @@ from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.typeinfo import Types
 from pyflink.datastream import (
     CheckpointingMode,
+    OutputTag,
     StreamExecutionEnvironment,
 )
 from pyflink.datastream.connectors.kafka import (
-    DeliveryGuarantee,
     KafkaOffsetsInitializer,
-    KafkaRecordSerializationSchema,
-    KafkaSink,
     KafkaSource,
 )
 from pyflink.datastream.functions import MapFunction, ProcessFunction
@@ -62,6 +60,7 @@ from common.config import (
     MINIO_SECRET_KEY,
     PIPELINE_VERSION,
     SOURCE_SYSTEM,
+    TOPIC_DLQ,
     TOPIC_NORMALIZED,
     TOPIC_VALIDATED,
 )
@@ -73,6 +72,7 @@ from common.iso_standards import (
     mcc_description,
 )
 from common.minio_sink import ensure_bucket, get_minio_client, write_record
+from common.kafka_utils import kafka_sink as _kafka_sink
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,6 +80,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+DLQ_TAG = OutputTag("dlq-normalize", Types.STRING())
 
 SILVER_PREFIX = "silver"
 
@@ -198,10 +200,19 @@ class NormalizeFn(ProcessFunction):
             yield json.dumps(record, ensure_ascii=False)
 
         except Exception as exc:
-            log.error("Normalisation error eventId=%s: %s", None, exc)
-            # Re-raise so Flink marks the record as failed and checkpointing
-            # can replay it rather than silently losing data
-            raise
+            event_id = record.get("eventId", "unknown") if isinstance(record, dict) else "parse-error"
+            log.error("Normalisation error eventId=%s: %s", event_id, exc)
+            dlq = {
+                "raw": value,
+                "error_type": "NORMALISATION_ERROR",
+                "error": str(exc),
+                "_meta": {
+                    "errorAt": datetime.now(timezone.utc).isoformat(),
+                    "job": "job3-normalize",
+                    "eventId": event_id,
+                }
+            }
+            yield DLQ_TAG, json.dumps(dlq, ensure_ascii=False)
 
 
 # ── MapFunction (MinIO silver write, pass-through) ─────────────────────────────
@@ -230,21 +241,7 @@ class SilverMinioFn(MapFunction):
         return value
 
 
-# ── KafkaSink factory ──────────────────────────────────────────────────────────
-
-def _kafka_sink(topic: str) -> KafkaSink:
-    return (
-        KafkaSink.builder()
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
-        .set_record_serializer(
-            KafkaRecordSerializationSchema.builder()
-            .set_topic(topic)
-            .set_value_serialization_schema(SimpleStringSchema())
-            .build()
-        )
-        .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE)
-        .build()
-    )
+# _kafka_sink is imported from common.kafka_utils (shared factory)
 
 
 # ── Job entry point ────────────────────────────────────────────────────────────
@@ -279,6 +276,15 @@ def main() -> None:
         .process(NormalizeFn(), output_type=Types.STRING())
         .uid("normalize-fn")
         .name("NormalizeFn")
+    )
+
+    # Route DLQ (normalisation errors) to payments.dlq
+    dlq_stream = processed.get_side_output(DLQ_TAG)
+    (
+        dlq_stream
+        .sink_to(_kafka_sink(TOPIC_DLQ))
+        .uid("dlq-normalize-sink")
+        .name("payments.dlq sink (normalization errors)")
     )
 
     # Write normalised records to MinIO silver, then forward to Kafka

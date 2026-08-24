@@ -1,0 +1,107 @@
+% ============================================================================
+% backMatter.tex — conclusion generale, bibliographie/netographie
+% ============================================================================
+
+\chapter*{Conclusion generale}
+\addcontentsline{toc}{chapter}{Conclusion generale}
+
+Ce projet de fin d'annee nous a permis de concevoir et de realiser une preuve de
+concept (PoC) complete d'une plateforme de streaming temps reel destinee a la
+detection de fraude bancaire, en reponse aux limites du pipeline batch nocturne
+actuellement en production chez HPS Group Morocco.
+
+Sur le plan technique, nous avons mis en place un pipeline reposant exclusivement sur
+des technologies open source : un cluster Apache Kafka gere par l'operateur Strimzi
+pour le transport des evenements, quatre jobs Apache Flink (PyFlink) assurant
+respectivement le decryptage, la validation selon neuf regles metier et ISO
+bancaires, la normalisation et l'optimisation des transactions, une architecture de
+stockage Medallion sur MinIO, et une persistance finale dans PostgreSQL via un
+connecteur Kafka Connect JDBC Sink. L'ensemble de cette infrastructure est
+provisionne de maniere reproductible via Terraform et supervise en temps reel par
+Prometheus et Grafana.
+
+Ce travail a egalement ete l'occasion de resoudre des difficultes techniques
+concretes, notamment l'incompatibilite du connecteur JDBC Sink avec les messages JSON
+schemaless --- resolue par l'introduction du composant \texttt{gold-flattener} --- ou
+encore la necessite de figer certaines versions logicielles (Python 3.11) pour
+garantir la stabilite des composants conteneurises.
+
+\textbf{Limites du PoC.} Plusieurs limites doivent etre soulignees. Le stockage du
+cluster Kafka et de PostgreSQL est actuellement de type \textit{ephemere}
+(\texttt{emptyDir}), ce qui implique une perte de donnees en cas de redemarrage des
+pods. Le cluster Flink fonctionne avec un seul JobManager, sans haute disponibilite.
+Enfin, l'exporteur de metriques metier s'execute actuellement en dehors du cluster
+Kubernetes, sur la machine hote.
+
+\textbf{Perspectives.} Plusieurs ameliorations sont envisagees pour une mise en
+production eventuelle :
+\begin{itemize}
+    \item migrer le stockage Kafka et PostgreSQL vers des \textit{Persistent Volume
+    Claims} (PVC) afin de garantir la persistance des donnees au-dela du cycle de vie
+    des pods,
+    \item conteneuriser l'exporteur de metriques metier afin de l'integrer pleinement
+    au cluster Kubernetes,
+    \item deployer Apache Flink en haute disponibilite (plusieurs JobManagers avec
+    election de leader),
+    \item migrer l'infrastructure de Minikube vers un cluster Kubernetes manage tel
+    qu'Azure Kubernetes Service (AKS), sans modification du code applicatif,
+    \item explorer une resolution plus profonde de la limitation du schema JSON
+    rencontree avec le connecteur JDBC Sink, par exemple via l'utilisation d'un
+    registre de schemas (Schema Registry).
+\end{itemize}
+
+En definitive, ce projet demontre la viabilite technique d'un pipeline de detection de
+fraude en temps reel construit entierement sur un socle open source, avec une latence
+de traitement de l'ordre de quelques secondes contre plusieurs heures pour le systeme
+batch existant.
+
+\newpage
+
+\chapter*{Bibliographie et Netographie}
+\addcontentsline{toc}{chapter}{Bibliographie et Netographie}
+
+\begin{thebibliography}{99}
+
+\bibitem{kafka} Apache Software Foundation, \textit{Apache Kafka Documentation},
+\url{https://kafka.apache.org/documentation/}.
+
+\bibitem{flink} Apache Software Foundation, \textit{Apache Flink Documentation ---
+PyFlink}, \url{https://nightlies.apache.org/flink/flink-docs-release-1.19/}.
+
+\bibitem{strimzi} Strimzi, \textit{Strimzi Documentation --- Running Apache Kafka on
+Kubernetes}, \url{https://strimzi.io/documentation/}.
+
+\bibitem{minio} MinIO, \textit{MinIO Object Storage Documentation},
+\url{https://min.io/docs/minio/linux/index.html}.
+
+\bibitem{postgresql} PostgreSQL Global Development Group, \textit{PostgreSQL
+Documentation}, \url{https://www.postgresql.org/docs/}.
+
+\bibitem{debezium} Debezium, \textit{Debezium JDBC Connector Documentation},
+\url{https://debezium.io/documentation/reference/stable/connectors/jdbc.html}.
+
+\bibitem{prometheus} Prometheus, \textit{Prometheus Documentation},
+\url{https://prometheus.io/docs/introduction/overview/}.
+
+\bibitem{grafana} Grafana Labs, \textit{Grafana Documentation},
+\url{https://grafana.com/docs/grafana/latest/}.
+
+\bibitem{terraform} HashiCorp, \textit{Terraform Documentation},
+\url{https://developer.hashicorp.com/terraform/docs}.
+
+\bibitem{iso8583} International Organization for Standardization, \textit{ISO 8583 ---
+Financial transaction card originated messages}.
+
+\bibitem{iso4217} International Organization for Standardization, \textit{ISO 4217 ---
+Currency codes}.
+
+\bibitem{iso7812} International Organization for Standardization, \textit{ISO 7812 ---
+Identification cards --- Identification of issuers}.
+
+\bibitem{pcidss} PCI Security Standards Council, \textit{PCI Data Security Standard
+(PCI-DSS)}, \url{https://www.pcisecuritystandards.org/}.
+
+\bibitem{kubernetes} The Kubernetes Authors, \textit{Kubernetes Documentation},
+\url{https://kubernetes.io/docs/home/}.
+
+\end{thebibliography}

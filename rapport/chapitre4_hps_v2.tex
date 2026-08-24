@@ -1,0 +1,437 @@
+% ============================================================
+% CHAPITRE 4 : Réalisation
+% Projet : Pipeline de Streaming Temps Réel --- HPS Group
+% Auteure : Asmae ABIDINE
+% ============================================================
+
+{\begin{center}\includegraphics[width=0.6\textwidth]{chapter4.png}\end{center}}
+
+\mysection{Chapitre 4}{Réalisation}
+\subsection*{Introduction}
+\phantomsection
+\addcontentsline{toc}{subsection}{Introduction}
+\vspace{0.5cm}
+
+Après avoir mené une analyse approfondie sur les plans théorique, fonctionnel et technique, nous passons désormais à la phase de réalisation de la plateforme de streaming temps réel pour HPS Group. Cette étape constitue le passage essentiel entre la conception et la mise en œuvre concrète du pipeline de traitement. Elle vise à transformer les spécifications et les choix architecturaux définis lors des phases précédentes en un système opérationnel et fonctionnel.
+\\[0.3cm]
+Le chapitre de réalisation présente ainsi la manière dont les différents composants ont été déployés et intégrés, ainsi que l'organisation générale du pipeline. Il permet de comprendre comment les concepts étudiés lors de l'analyse technique ont été appliqués pour produire une solution cohérente, répondant aux exigences de traitement temps réel des transactions de paiement HPS SWAM.
+\\[0.3cm]
+Cette phase illustre la transformation d'une conception abstraite en une solution tangible et mesurable : quatre jobs PyFlink en cours d'exécution, des données circulant de PostgreSQL jusqu'au Data Mart en quelques secondes, et une architecture Medallion Bronze/Silver/Gold pleinement opérationnelle sur Kubernetes.
+\\[0.3cm]
+En explorant ce chapitre, le lecteur pourra appréhender le déploiement de chaque composant du pipeline, les interfaces de monitoring, et les résultats concrets obtenus lors des tests de validation du PoC.
+
+\newpage
+
+% ============================================================
+\subsection{Déploiement de l'Infrastructure Kubernetes}
+\vspace{0.5cm}
+
+\subsubsection{Provisionnement via Terraform}
+\vspace{0.3cm}
+
+L'infrastructure complète du pipeline est provisionnée via Terraform en une seule commande \texttt{terraform apply}. Le déploiement crée automatiquement les quatre namespaces Kubernetes, installe les opérateurs Strimzi et MinIO via Helm, configure le cluster Kafka en mode KRaft, et déploie le cluster Flink avec son image personnalisée \texttt{hps-flink:1.0}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{terraform-apply.png}
+  \caption{Résultat du déploiement Terraform --- Infrastructure complète provisionnée}
+  \label{fig:terraformApply}
+\end{figure}
+
+\newpage
+
+\subsubsection{État des Pods Kubernetes}
+\vspace{0.3cm}
+
+Une fois l'infrastructure déployée, l'ensemble des pods des quatre namespaces sont en état \texttt{Running}. La commande \texttt{kubectl get pods --all-namespaces} confirme la disponibilité de tous les composants du pipeline : Kafka broker, Flink JobManager et TaskManagers, MinIO, Kafka Connect et les deux instances PostgreSQL.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{pods-running.png}
+  \caption{État des pods Kubernetes --- Tous les composants en état Running}
+  \label{fig:podsRunning}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsection{Apache Kafka --- Cluster KRaft et Topics}
+\vspace{0.5cm}
+
+\subsubsection{Cluster Kafka en Mode KRaft}
+\vspace{0.3cm}
+
+Le cluster Kafka est déployé via l'opérateur Strimzi 0.51.0 en mode KRaft (sans ZooKeeper). Le broker \texttt{hps-cluster-dual-role-0} joue simultanément le rôle de controller et de broker, conformément à la configuration dual-role choisie pour le PoC. Le dashboard Strimzi confirme l'état \texttt{Ready} du cluster et l'absence de tout pod ZooKeeper.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{kafka-cluster.png}
+  \caption{Cluster Kafka Strimzi en mode KRaft --- État Ready}
+  \label{fig:kafkaCluster}
+\end{figure}
+
+\newpage
+
+\subsubsection{Topics Kafka du Pipeline}
+\vspace{0.3cm}
+
+Les six topics Kafka sont créés explicitement via des ressources \texttt{KafkaTopic} Kubernetes, chacun avec sa politique de rétention configurée. La commande \texttt{kubectl get kafkatopic -n kafka} confirme l'état \texttt{Ready} de l'ensemble des topics, garantissant que le pipeline peut démarrer sans création implicite.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{kafka-topics.png}
+  \caption{Topics Kafka du pipeline --- Tous en état Ready}
+  \label{fig:kafkaTopics}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsection{Apache Flink --- Jobs de Traitement}
+\vspace{0.5cm}
+
+\subsubsection{Flink Dashboard --- Vue d'Ensemble}
+\vspace{0.3cm}
+
+Le Flink Dashboard (\texttt{http://localhost:8081}) offre une vue en temps réel de l'état du cluster Flink et des jobs en cours d'exécution. L'interface confirme la présence de trois TaskManagers avec six slots disponibles, et les quatre jobs PyFlink en état \texttt{RUNNING}. Le checkpointing \texttt{EXACTLY\_ONCE} toutes les 30 secondes est visible dans les métriques de chaque job.
+
+\begin{figure}[H]
+\hspace{-1.5cm}
+\includegraphics[width=1.2\textwidth]{flink-dashboard.png}
+  \caption{Flink Dashboard --- 4 jobs RUNNING avec checkpointing EXACTLY\_ONCE}
+  \label{fig:flinkDashboard}
+\end{figure}
+
+\newpage
+
+\subsubsection{Job 1 --- Décryption Fernet}
+\vspace{0.3cm}
+
+Le Job 1 lit les messages chiffrés du topic \texttt{payments}, déchiffre le payload Fernet, et écrit les enregistrements bruts dans la couche Bronze de MinIO. En cas d'échec de déchiffrement (\texttt{InvalidToken}), le message est routé vers \texttt{payments.dlq} sans jamais exposer le payload chiffré. Le graphe d'exécution Flink montre le flux \texttt{KafkaSource} $\rightarrow$ \texttt{DecryptFn} $\rightarrow$ \texttt{BronzeMinioFn} $\rightarrow$ \texttt{KafkaSink}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{flink-job1.png}
+  \caption{Job 1 Décryption --- Graphe d'exécution et métriques}
+  \label{fig:flinkJob1}
+\end{figure}
+
+\newpage
+
+\subsubsection{Job 2 --- Validation (9 Règles)}
+\vspace{0.3cm}
+
+Le Job 2 applique 9 règles de validation en une seule passe sur chaque transaction décryptée. Les 6 règles métier HPS vérifient les champs obligatoires et la conformité business. Les 3 règles ISO bancaires ajoutent la conformité réglementaire internationale : ISO 8583 (MTI), ISO 4217 (devise), ISO 7812 (Luhn). Toute transaction invalide est envoyée vers \texttt{payments.dlq} avec un code de rejet machine-readable.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{flink-job2.png}
+  \caption{Job 2 Validation --- Application des 9 règles HPS + ISO}
+  \label{fig:flinkJob2}
+\end{figure}
+
+\newpage
+
+\subsubsection{Job 3 --- Normalisation et Enrichissement}
+\vspace{0.3cm}
+
+Le Job 3 normalise les données validées : conversion des 8 champs date du format \texttt{DD/MM/YYYY HH:MM} vers ISO 8601, conversion des montants en notation scientifique européenne (\texttt{0,11E+02} $\rightarrow$ \texttt{11.0}), et enrichissement avec les métadonnées ISO : \texttt{card\_scheme} (VISA/Mastercard/AMEX), \texttt{mti\_name}, \texttt{currency\_alpha}, \texttt{mcc\_description}. Les résultats sont écrits dans la couche Silver de MinIO.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{flink-job3.png}
+  \caption{Job 3 Normalisation --- Dates ISO 8601, montants float, enrichissements}
+  \label{fig:flinkJob3}
+\end{figure}
+
+\newpage
+
+\subsubsection{Job 4 --- Optimisation et Scoring}
+\vspace{0.3cm}
+
+Le Job 4 est le job le plus avancé du pipeline. Il utilise un \texttt{KeyedProcessFunction} avec \texttt{ValueState} pour la déduplication par \texttt{AUTHORIZATION\_CODE}, route chaque transaction vers le canal approprié (\texttt{SO\_CARTE} si \texttt{PRODUCT\_CODE=6}, sinon \texttt{SO\_MOBILE}), et calcule un score de risque (\texttt{HIGH/MEDIUM/LOW}) selon les règles métier. Le résultat enrichi est publié dans \texttt{payments.gold} et écrit dans la couche Gold de MinIO.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{flink-job4.png}
+  \caption{Job 4 Optimisation --- Déduplication KeyedState, risk scoring, payments.gold}
+  \label{fig:flinkJob4}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsection{MinIO --- Architecture Medallion}
+\vspace{0.5cm}
+
+\subsubsection{Console MinIO --- Vue des Couches}
+\vspace{0.3cm}
+
+La console MinIO (\texttt{http://localhost:9001}) offre une vue graphique des objets stockés dans le bucket \texttt{rt-payments}. Les trois préfixes \texttt{bronze/}, \texttt{silver/} et \texttt{gold/} correspondent aux trois couches de l'architecture Medallion, chacune alimentée en temps réel par le job Flink correspondant. Chaque objet est nommé selon le pattern \texttt{<prefix>/<date>/<uuid>.json}.
+
+\begin{figure}[H]
+\hspace{-1.5cm}
+\includegraphics[width=1.2\textwidth]{minio-console.png}
+  \caption{Console MinIO --- Bucket rt-payments avec les couches Bronze, Silver, Gold}
+  \label{fig:minioConsole}
+\end{figure}
+
+\newpage
+
+\subsubsection{Couche Bronze --- Enregistrements Bruts}
+\vspace{0.3cm}
+
+La couche Bronze du bucket \texttt{rt-payments} héberge les données brutes déchiffrées écrites par le Job 1 immédiatement après le déchiffrement Fernet. Chaque objet est un enregistrement JSON au format exact issu de l'enveloppe Kafka, conservé pour des fins d'audit, de traçabilité et de reprocessing en cas d'anomalie dans les couches supérieures.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{minio-bronze.png}
+  \caption{Couche Bronze --- Enregistrements bruts décryptés dans MinIO}
+  \label{fig:minioBronze}
+\end{figure}
+
+\newpage
+
+\subsubsection{Couche Gold --- Enregistrements Enrichis}
+\vspace{0.3cm}
+
+La couche Gold du bucket \texttt{rt-payments} héberge les enregistrements JSON pleinement enrichis, écrits par le Job 4 après déduplication par \texttt{AUTHORIZATION\_CODE}, scoring de risque et routage par canal de paiement. Ces objets constituent les données prêtes pour l'analyse, reflétant l'état final de chaque transaction après traversée complète du pipeline.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{minio-gold.png}
+  \caption{Couche Gold --- Enregistrements enrichis avec \texttt{risk\_score} et \texttt{payment\_channel}}
+  \label{fig:minioGold}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsection{Kafka Connect et Debezium}
+\vspace{0.5cm}
+
+Le service \texttt{gold-sink} est un consumer Python personnalisé déployé dans le namespace \texttt{kafka-connect}. Il consomme en continu le topic \texttt{payments.gold}, aplatit le sous-objet \texttt{transaction} en 18 colonnes distinctes, et effectue un \texttt{UPSERT ON CONFLICT (authorization\_code)} dans la table \texttt{fact\_transactions} du Data Mart PostgreSQL. Cette approche a été choisie en remplacement du connecteur Kafka Connect JDBC Sink, incompatible avec les messages \texttt{payments.gold} de type JSON schemaless (sans Avro ni Schema Registry).
+
+\subsubsection{Debezium Source Connector --- CDC Actif}
+\vspace{0.3cm}
+
+Le connecteur Debezium Source est déployé dans le namespace \texttt{kafka-connect} pour capturer en temps réel les modifications de la table \texttt{hps.public.transactions} via la réplication logique PostgreSQL (\texttt{wal\_level=logical}). L'API REST Kafka Connect confirme l'état \texttt{RUNNING} du connecteur, avec un slot de réplication actif et les 8 enregistrements source déjà capturés.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{debezium-running.png}
+  \caption{Debezium Source Connector --- État RUNNING, CDC actif sur PostgreSQL}
+  \label{fig:debeziumRunning}
+\end{figure}
+
+\newpage
+
+\subsubsection{Vérification du CDC --- Messages Capturés}
+\vspace{0.3cm}
+
+La vérification du CDC confirme que Debezium publie correctement les enregistrements capturés dans le topic \texttt{hps.public.transactions}. Chaque message contient l'enveloppe CDC standard avec les champs \texttt{before}/\texttt{after}, le type d'opération (\texttt{c} pour INSERT, \texttt{u} pour UPDATE, \texttt{d} pour DELETE) et les métadonnées de transaction (LSN, timestamp).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{debezium-messages.png}
+  \caption{CDC Debezium --- Messages capturés dans \texttt{hps.public.transactions}}
+  \label{fig:debeziumMessages}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsection{Data Mart PostgreSQL --- Alimentation en Temps Réel}
+\vspace{0.5cm}
+
+\subsubsection{Table fact\_transactions --- Résultats}
+\vspace{0.3cm}
+
+La table \texttt{fact\_transactions} du Data Mart PostgreSQL héberge les enregistrements enrichis issus du topic \texttt{payments.gold}. La requête \texttt{SELECT COUNT(*) FROM fact\_transactions} confirme la présence de 16 lignes après le cycle de test initial. La distribution par score de risque et par canal de paiement est consultable via des requêtes analytiques directes.
+\\[0.3cm]
+La vue détaillée de la table \texttt{fact\_transactions} confirme la présence des 16 enregistrements UPSERT avec l'ensemble de leurs colonnes enrichies : \texttt{authorization\_code} (clé primaire), \texttt{transaction\_amount}, \texttt{risk\_score}, \texttt{payment\_channel}, \texttt{card\_scheme}, \texttt{mcc\_description}, \texttt{processed\_at} et les champs de dimension ISO.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{datamart-rows.png}
+  \caption{Data Mart --- \texttt{fact\_transactions} alimentée en temps réel (16 lignes)}
+  \label{fig:datamartRows}
+\end{figure}
+
+\newpage
+
+\subsubsection{Requêtes Analytiques}
+\vspace{0.3cm}
+
+Le Data Mart PostgreSQL supporte des requêtes analytiques en temps réel sur les données enrichies. La vue \texttt{v\_risk\_summary} agrège les transactions par score de risque et canal de paiement, offrant une synthèse immédiatement exploitable par les équipes métier pour la détection de fraudes et le reporting réglementaire.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{datamart-analytics.png}
+  \caption{Vue \texttt{v\_risk\_summary} --- Analyse par score de risque et canal de paiement}
+  \label{fig:datamartAnalytics}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsection{Monitoring --- Prometheus et Grafana}
+\vspace{0.5cm}
+
+\subsubsection{Grafana --- Dashboard HPS Streaming Pipeline}
+\vspace{0.3cm}
+
+Le dashboard Grafana \textit{HPS Streaming Pipeline} offre une vue consolidée des métriques techniques et métier du pipeline en temps réel. Il est provisionné automatiquement via l'API REST Grafana et interroge Prometheus en PromQL. Le dashboard final présente 7 panneaux organisés en trois lignes :
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{Ligne 1 --- KPIs Pipeline} : quatre panneaux stat affichant en temps réel : Payments Processed (140), DLQ Rejected (137), Flink Jobs Running (4) et Last Checkpoint (12ms).
+
+    \item \textbf{Ligne 2 --- Architecture Medallion} : trois panneaux stat affichant le nombre d'objets par couche : Bronze (350), Silver (776), Gold (749).
+
+    \item \textbf{Ligne 3 --- Pipeline Flow} : un graphe temporel montrant l'évolution cumulative des messages dans chaque topic Kafka, permettant de visualiser le flux de données à travers les cinq étapes du pipeline.
+\end{itemize}
+
+\begin{figure}[H]
+\hspace{-1.5cm}
+\includegraphics[width=1.2\textwidth]{grafana-dashboard.png}
+  \caption{Dashboard Grafana --- HPS Streaming Pipeline en temps réel}
+  \label{fig:grafanaDashboard}
+\end{figure}
+
+\newpage
+
+\subsubsection{Exporteur de Métriques Métier}
+\vspace{0.3cm}
+
+En complément des métriques techniques exposées par Flink et MinIO, un exporteur Python personnalisé \texttt{hps\_exporter.py} a été développé pour exposer les KPIs métier du pipeline à Prometheus. Cet exporteur interroge périodiquement les offsets Kafka par topic, le nombre d'objets MinIO par couche Medallion et les statistiques du Data Mart PostgreSQL, et les expose au format Prometheus sur le port \texttt{:8888}.
+
+\vspace{0.3cm}
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{|l|p{10cm}|}
+\hline
+\textbf{Métrique} & \textbf{Description} \\
+\hline
+\texttt{hps\_payments\_total\{stage\}} &
+Nombre de messages par étape du pipeline
+(raw\_encrypted, decrypted, validated,
+gold\_enriched, dead\_letter) \\
+\hline
+\texttt{hps\_minio\_objects\{layer\}} &
+Nombre d'objets par couche Medallion
+(bronze, silver, gold) \\
+\hline
+\texttt{hps\_datamart\_total} &
+Nombre de lignes dans \texttt{fact\_transactions} \\
+\hline
+\texttt{hps\_risk\_score\_total\{risk\}} &
+Transactions par score de risque
+(HIGH, MEDIUM, LOW) \\
+\hline
+\texttt{hps\_payment\_channel\_total\{channel\}} &
+Transactions par canal de paiement
+(SO\_CARTE, SO\_MOBILE) \\
+\hline
+\end{tabular}
+\caption{Métriques métier exposées par l'exporteur \texttt{hps\_exporter.py}}
+\label{tab:metriques}
+\end{table}
+
+\newpage
+
+\subsubsection{Prometheus --- Découverte des Cibles}
+\vspace{0.3cm}
+
+Prometheus est déployé dans le namespace \texttt{monitoring} avec un \texttt{ServiceAccount} doté d'un \texttt{ClusterRole} permettant la découverte automatique des pods Flink via \texttt{kubernetes\_sd\_configs}. La page \texttt{/targets} de l'interface Prometheus confirme que toutes les cibles sont en état \texttt{UP} : JobManager Flink (cible statique sur \texttt{:9249}), TaskManagers Flink (découverte par label \texttt{component=taskmanager}), MinIO (\texttt{/minio/v2/metrics/cluster}) et l'exporteur de métriques métier (\texttt{10.255.255.254:8888}).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{prometheus-targets.png}
+  \caption{Prometheus --- Toutes les cibles de scrape en état UP}
+  \label{fig:prometheusTargets}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsection{Validation Globale du Pipeline}
+\vspace{0.5cm}
+
+\subsubsection{Volumes de Données par Étape}
+\vspace{0.3cm}
+
+Le tableau suivant présente les volumes de données mesurés dans chaque composant du pipeline lors des tests de validation du PoC. Ces chiffres confirment le bon fonctionnement du pipeline de bout en bout : les transactions progressent de la source vers le Data Mart, les enregistrements invalides sont correctement routés vers la DLQ, et les doublons sont éliminés par la déduplication du Job 4.
+
+\vspace{0.3cm}
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{|l|r|l|}
+\hline
+\textbf{Composant / Topic} & \textbf{Nb enregistrements} & \textbf{Étape} \\
+\hline
+\texttt{payments}              & 320  & Source --- transactions chiffrées publiées \\
+\texttt{payments.decrypted}    & 350  & Après décryption Fernet (Job 1) \\
+\texttt{payments.dlq}          & 137  & Enregistrements rejetés (DLQ toutes étapes) \\
+\texttt{payments.validated}    & 517  & Après validation 9 règles (Job 2) \\
+\texttt{payments.normalized}   & 776  & Après normalisation ISO (Job 3) \\
+\texttt{payments.gold}         & 140  & Enregistrements enrichis finaux (Job 4) \\
+\hline
+MinIO \texttt{bronze/}         & 350  & Objets couche Bronze \\
+MinIO \texttt{silver/}         & 776  & Objets couche Silver \\
+MinIO \texttt{gold/}           & 749  & Objets couche Gold \\
+\hline
+\texttt{hps.public.transactions} & 8  & Table source PostgreSQL (Debezium CDC) \\
+\texttt{fact\_transactions}    & 16   & Data Mart --- enregistrements UPSERT \\
+\hline
+\end{tabular}
+\caption{Volumes de données mesurés par étape du pipeline HPS}
+\label{tab:volumes}
+\end{table}
+
+\subsubsection{Exemple d'Enregistrement Gold}
+\vspace{0.3cm}
+
+Chaque objet de la couche Gold contient un enregistrement JSON pleinement enrichi, avec les champs métier calculés par le Job 4. Le tableau suivant présente les champs d'enrichissement d'un enregistrement Gold représentatif du pipeline HPS :
+
+\vspace{0.3cm}
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Champ} & \textbf{Valeur} \\
+\hline
+\texttt{card\_scheme}        & \texttt{UNKNOWN} (PAN masqué) \\
+\texttt{mti\_name}           & \texttt{Authorization Request} \\
+\texttt{currency\_alpha}     & \texttt{MAD} \\
+\texttt{currency\_minor\_units} & \texttt{2} \\
+\texttt{payment\_channel}    & \texttt{SO\_MOBILE} \\
+\texttt{risk\_score}         & \texttt{MEDIUM} \\
+\texttt{processed\_at}       & \texttt{2026-06-05T10:00:00+00:00} \\
+\texttt{source\_system}      & \texttt{HPS\_SWAM} \\
+\texttt{pipeline\_version}   & \texttt{1.0.0} \\
+\hline
+\end{tabular}
+\caption{Champs d'enrichissement d'un enregistrement Gold du pipeline HPS}
+\label{tab:goldRecord}
+\end{table}
+
+\newpage
+
+% ============================================================
+\subsection*{Conclusion}
+\phantomsection
+\addcontentsline{toc}{subsection}{Conclusion}
+\vspace{0.5cm}
+
+Ce chapitre a présenté la réalisation complète de la plateforme de streaming temps réel pour HPS Group, depuis le déploiement de l'infrastructure Kubernetes jusqu'aux résultats de validation du pipeline en conditions réelles.
+\\[0.3cm]
+Le déploiement via Terraform a démontré la reproductibilité de l'infrastructure en une seule commande \texttt{terraform apply}, créant simultanément les cinq namespaces Kubernetes, le cluster Kafka KRaft via Strimzi, le cluster Flink avec ses quatre jobs PyFlink, le data lake MinIO et le Data Mart PostgreSQL. L'ensemble des pods est opérationnel et les topics Kafka sont correctement créés avec leurs politiques de rétention respectives.
+\\[0.3cm]
+Les quatre jobs Flink en état \texttt{RUNNING} traitent les transactions en flux continu avec le mode de checkpointing \texttt{EXACTLY\_ONCE}, garantissant l'intégrité des données à chaque étape. Le Job 1 déchiffre et écrit en couche Bronze, le Job 2 applique les 9 règles de validation ISO, le Job 3 normalise et enrichit vers la couche Silver, et le Job 4 déduplique et score avant l'écriture en couche Gold et la publication dans \texttt{payments.gold}.
+\\[0.3cm]
+Les mesures de validation confirment la cohérence du pipeline : 320 transactions publiées initialement, 350 enregistrements déchiffrés (couche Bronze), 776 enregistrements normalisés (couche Silver), 140 enregistrements gold publiés dans \texttt{payments.gold}, 137 rejets correctement isolés dans la DLQ, et 16 enregistrements UPSERT dans le Data Mart PostgreSQL. L'exporteur de métriques métier \texttt{hps\_exporter.py} expose ces KPIs à Prometheus, alimentant en temps réel le dashboard Grafana en 7 panneaux qui constitue la vitrine opérationnelle du pipeline HPS.
+
+\newpage

@@ -1,0 +1,44 @@
+%%{init: {'theme': 'neutral'}}%%
+flowchart LR
+    ENG(["🧑‍💻\nData Engineer\n(Intern)"])
+    SRC(["🗄️\nPayment Source\n(Kaggle CSV feed)"])
+    MGR(["👔\nManager / Analyst"])
+    OPS(["📈\nMonitoring\n(Prometheus/Grafana)"])
+
+    subgraph SYS["System boundary — HPS Real-Time Payment Pipeline"]
+        UC1(["Ingest payment\ntransactions"])
+        UC2(["Encrypt sensitive\ncard data (Fernet)"])
+        UC3(["Decrypt & verify\nintegrity"])
+        UC4(["Validate against\nISO 8583/4217/7812 rules"])
+        UC5(["Normalize & enrich\n(MCC, card scheme, currency)"])
+        UC6(["Score risk &\ndetect duplicates"])
+        UC7(["Persist to data lake\n(Bronze / Silver / Gold)"])
+        UC8(["Sync enriched records\nto data mart"])
+        UC9(["Route rejected records\nto dead-letter queue"])
+        UC10(["Expose pipeline\n& business metrics"])
+        UC11(["Visualize KPIs on\nGrafana dashboard"])
+        UC12(["Query transaction\ndata mart"])
+    end
+
+    SRC --- UC1
+    ENG --- UC1
+    ENG --- UC2
+    UC1 --- UC2
+    UC2 --- UC3
+    UC3 --- UC4
+    UC4 --- UC5
+    UC5 --- UC6
+    UC6 --- UC7
+    UC7 --- UC8
+    UC3 -.-> UC9
+    UC4 -.-> UC9
+    ENG --- UC10
+    OPS --- UC10
+    UC10 --- UC11
+    MGR --- UC11
+    MGR --- UC12
+
+    classDef actor fill:#fff3cd,stroke:#a67c00,color:#000
+    classDef usecase fill:#e2ecfd,stroke:#2c5fa8,color:#000
+    class ENG,SRC,MGR,OPS actor
+    class UC1,UC2,UC3,UC4,UC5,UC6,UC7,UC8,UC9,UC10,UC11,UC12 usecase

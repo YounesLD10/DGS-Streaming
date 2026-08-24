@@ -1,0 +1,64 @@
+%%{init: {'theme': 'neutral'}}%%
+sequenceDiagram
+    autonumber
+    participant P as Producer (Python)
+    participant K0 as Kafka: payments
+    participant J1 as Job1: DecryptFn
+    participant MB as MinIO: bronze/
+    participant K1 as Kafka: payments.decrypted
+    participant J2 as Job2: ValidateFn
+    participant K2 as Kafka: payments.validated
+    participant J3 as Job3: NormalizeFn
+    participant MS as MinIO: silver/
+    participant K3 as Kafka: payments.normalized
+    participant J4 as Job4: OptimizeFn
+    participant MG as MinIO: gold/
+    participant K4 as Kafka: payments.gold
+    participant GS as gold-sink consumer
+    participant PG as Postgres: fact_transactions
+    participant DLQ as Kafka: payments.dlq
+
+    P->>P: Fernet.encrypt(record) + CDC envelope
+    P->>K0: publish(payments, ciphertext)
+
+    K0->>J1: poll record
+    activate J1
+    J1->>J1: Fernet.decrypt(token)
+    alt decryption succeeds
+        J1->>MB: write_record(bronze/, record)
+        J1->>K1: emit decrypted JSON
+    else InvalidToken / tampered payload
+        J1->>DLQ: side-output via OutputTag(dlq-decrypt)
+    end
+    deactivate J1
+
+    K1->>J2: poll record
+    activate J2
+    J2->>J2: _validate_transaction() — 9 ordered rules<br/>(MTI, amount, currency, ISO 8583/4217/7812 Luhn)
+    alt all rules pass
+        J2->>K2: emit validated JSON
+    else any rule fails
+        J2->>DLQ: side-output with reject reason code
+    end
+    deactivate J2
+
+    K2->>J3: poll record
+    activate J3
+    J3->>J3: _normalize_transaction()<br/>parse date/amount, enrich card_scheme, MCC, currency
+    J3->>MS: write_record(silver/, record)
+    J3->>K3: emit normalized JSON
+    deactivate J3
+
+    K3->>J4: poll record
+    activate J4
+    J4->>J4: ValueState["seen"].value() — dedup check
+    J4->>J4: _risk_score(), _payment_channel(), _extract_auth_code()
+    J4->>MG: write_record(gold/, record)
+    J4->>K4: emit enriched gold JSON
+    deactivate J4
+
+    K4->>GS: poll(payments.gold)
+    activate GS
+    GS->>GS: flatten nested "transaction" object → 18 columns
+    GS->>PG: UPSERT ... ON CONFLICT(authorization_code)
+    deactivate GS

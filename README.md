@@ -17,7 +17,10 @@
 8. [Exécution du producteur](#8-exécution-du-producteur)
 9. [Sécurité réseau et RBAC](#9-sécurité-réseau-et-rbac)
 10. [Dépannage — Problèmes rencontrés](#10-dépannage--problèmes-rencontrés)
-11. [Suppression de l'infrastructure](#11-suppression-de-linfrastructure)
+11. [Data Mart PostgreSQL — Schéma en étoile](#11-data-mart-postgresql--schéma-en-étoile)
+12. [Pipeline Gold → Data Mart (gold-sink)](#12-pipeline-gold--data-mart-gold-sink)
+13. [Monitoring Business — Exporteur & Dashboards Grafana](#13-monitoring-business--exporteur--dashboards-grafana)
+14. [Suppression de l'infrastructure](#14-suppression-de-linfrastructure)
 
 ---
 
@@ -192,7 +195,30 @@ hps-rt-poc/
     ├── outputs.tf                # Endpoints de sortie (bootstrap, minio, flink REST)
     ├── kafka.tf                  # Strimzi operator + KafkaNodePool + Kafka + KafkaTopic
     ├── minio.tf                  # Helm release MinIO
-    └── flink.tf                  # Session cluster Flink (JM + TM + ConfigMap)
+    ├── flink.tf                  # Session cluster Flink (JM + TM + ConfigMap)
+    └── postgres.tf               # Schéma Data Mart (ConfigMaps + apply idempotent via psql)
+```
+
+### 4.1 Fichiers ajoutés — Data Mart & Monitoring Business
+
+En complément de l'arborescence ci-dessus, les fichiers suivants implémentent le
+data mart PostgreSQL, le pont Kafka → PostgreSQL et le monitoring métier
+(voir sections [11](#11-data-mart-postgresql--schéma-en-étoile),
+[12](#12-pipeline-gold--data-mart-gold-sink) et
+[13](#13-monitoring-business--exporteur--dashboards-grafana)) :
+
+```
+hps-rt-poc/
+├── sql/
+│   ├── datamart_schema.sql           # Schéma en étoile : fact_transactions + dims + trigger
+│   ├── source_transactions_schema.sql # Table source CDC (postgres-hps/hps_db)
+│   └── analytics.sql                  # 6 requêtes d'analyse métier
+├── scripts/
+│   ├── hps_exporter.py               # Exporteur Prometheus métriques métier (:8888/metrics)
+│   ├── create_dashboards.py          # Dashboards Grafana existants (helpers réutilisés)
+│   └── create_business_dashboards.py # 2 nouveaux dashboards (Business Analytics, Data Quality)
+└── terraform/
+    └── postgres.tf                   # Application idempotente du schéma star schema
 ```
 
 ---
@@ -651,7 +677,217 @@ terraform apply -target=null_resource.flink_cluster -auto-approve
 
 ---
 
-## 11. Suppression de l'infrastructure
+## 11. Data Mart PostgreSQL — Schéma en étoile
+
+### 11.1 Vue d'ensemble
+
+Le namespace `kafka-connect` (pré-existant, déployé hors Terraform pour les
+`Deployment`/`Service`) héberge **deux bases PostgreSQL 15** et un cluster
+**Debezium Kafka Connect** :
+
+| Pod | Base | Rôle |
+|-----|------|------|
+| `postgres-datamart` | `datamart` | **Data Mart en étoile** — cible finale du pipeline Gold |
+| `postgres-hps` | `hps_db` | Table source `public.transactions` — alimente le connecteur CDC `debezium-hps-source` |
+
+Terraform ne recrée **pas** ces `Deployment`/`Service` (pour ne pas entrer en
+conflit avec les ressources existantes). Le fichier
+[`terraform/postgres.tf`](terraform/postgres.tf) se limite à :
+
+1. Stocker les scripts SQL dans des `ConfigMap` (`datamart-schema-sql`, `source-transactions-schema-sql`)
+2. Les appliquer via `null_resource` + `local-exec` (`psql -U hps -d <db> < script.sql`)
+
+Les deux scripts sont **idempotents** (`CREATE TABLE IF NOT EXISTS`,
+`ON CONFLICT DO NOTHING`, `CREATE OR REPLACE`), donc rejouables sans risque.
+
+### 11.2 Schéma en étoile (`sql/datamart_schema.sql`)
+
+```mermaid
+erDiagram
+    fact_transactions }o--|| dim_risk   : risk_id
+    fact_transactions }o--|| dim_canal  : canal_id
+    fact_transactions }o--|| dim_banque : banque_id
+    fact_transactions }o--|| dim_date   : date_id
+
+    fact_transactions {
+        text authorization_code PK
+        text message_type
+        numeric transaction_amount
+        text currency_code
+        text card_type
+        text mti_name
+        text mcc_description
+        timestamptz processed_at
+        int risk_id FK
+        int canal_id FK
+        int banque_id FK
+        int date_id FK
+    }
+    dim_risk   { int risk_id PK, text risk_score }
+    dim_canal  { int canal_id PK, text payment_channel }
+    dim_banque { int banque_id PK, text issuing_bank }
+    dim_date   { int date_id PK, date full_date, int year, int month, int quarter }
+```
+
+- **`fact_transactions`** : superset des colonnes attendues par `gold-sink`
+  (PK `authorization_code`) **+** les clés étrangères du schéma en étoile.
+- **Dimension resolution** : les FKs (`risk_id`, `canal_id`, `banque_id`, `date_id`)
+  sont résolues dans le code Python de `gold-sink` via des upserts atomiques par
+  dimension avant chaque INSERT — `fn_set_dims()` et `trg_set_dims` ont été supprimés.
+  Les colonnes dénormalisées `risk_score`, `payment_channel`, `issuing_bank` ont été
+  retirées de `fact_transactions` (elles existent exclusivement dans les tables dim).
+- **`v_risk_summary`** : vue pré-calculée (count / total / moyenne par
+  `risk_score`), utilisée par `sql/analytics.sql` (requête 6).
+
+### 11.3 Application / ré-application du schéma
+
+```bash
+# Via Terraform (idempotent, déclenché si le SQL change — filemd5 trigger)
+cd ~/hps-rt-poc/terraform
+terraform apply -target=null_resource.apply_datamart_schema \
+                 -target=null_resource.apply_source_transactions_schema -auto-approve
+
+# Ou directement en psql (équivalent)
+PG_POD=$(minikube kubectl -- get pod -n kafka-connect -l app=postgres-datamart -o jsonpath='{.items[0].metadata.name}')
+minikube kubectl -- exec -i -n kafka-connect "$PG_POD" -- psql -U hps -d datamart < sql/datamart_schema.sql
+```
+
+> ⚠️ **Stockage `emptyDir`** : `postgres-datamart` et `postgres-hps` utilisent
+> un volume `emptyDir` (pas de PVC). Les données et le schéma sont **perdus**
+> si le **Pod** est recréé (recréation de pod, pas simple redémarrage de
+> conteneur). Après un `minikube start` qui recrée les pods, ré-exécuter la
+> commande ci-dessus avant de relancer `gold-sink`.
+
+---
+
+## 12. Pipeline Gold → Data Mart (gold-sink)
+
+### 12.1 Mode d'architecture retenu : `python-bridge`
+
+Deux approches ont été évaluées pour charger `payments.gold` dans
+`fact_transactions` :
+
+| Mode | Statut | Détail |
+|------|--------|--------|
+| **Kafka Connect — Debezium JDBC sink** | ❌ Abandonné | `NullPointerException` dans `SinkRecordDescriptor.Builder.isFlattened()` : le sink JDBC Debezium exige une enveloppe `{"schema": …, "payload": …}` (`value.converter.schemas.enable=true`), alors que `payments.gold` est du **JSON plat sans schéma**. Le connecteur `fact-transactions-sink` a été créé puis **supprimé** après échec. |
+| **`gold-sink` — pont Python (psycopg2)** | ✅ **Actif** (mode retenu) | `Deployment` pré-existant `gold-sink` (namespace `kafka-connect`), consomme `payments.gold` via `kafka-python` et exécute des `INSERT … ON CONFLICT` dans `fact_transactions`. |
+
+### 12.2 `gold-sink` — détails
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Image | `python:3.11-slim` |
+| Script | `/scripts/payments_gold_sink.py` (monté via `ConfigMap gold-sink-script`) |
+| Topic source | `payments.gold` |
+| Consumer group | `gold-sink-datamart` |
+| Cible | `postgres-datamart.kafka-connect.svc:5432` / db `datamart` |
+| Dépendance corrigée | `kafka-python==2.3.1` épinglé (la version par défaut provoquait une `ImportError` au démarrage) |
+
+Le pipeline complet retenu pour ce PoC est donc :
+
+```
+Flink job4 (optimize) ──► topic payments.gold ──► gold-sink (python-bridge)
+                                                        │  INSERT ... ON CONFLICT
+                                                        ▼
+                                          fact_transactions (+ trigger fn_set_dims)
+                                                        │
+                                          dim_risk / dim_canal / dim_banque / dim_date
+```
+
+Vérification rapide :
+
+```bash
+minikube kubectl -- logs -n kafka-connect deploy/gold-sink --tail=20
+# → "Committed N rows (total=... skipped=... errors=...)"
+
+PG_POD=$(minikube kubectl -- get pod -n kafka-connect -l app=postgres-datamart -o jsonpath='{.items[0].metadata.name}')
+minikube kubectl -- exec -n kafka-connect "$PG_POD" -- psql -U hps -d datamart -c "SELECT COUNT(*) FROM fact_transactions;"
+```
+
+### 12.3 Connecteur CDC `debezium-hps-source` (indépendant)
+
+Le connecteur Debezium **source** `debezium-hps-source` (déjà en place avant
+ce PoC) reste actif en parallèle : il capture `postgres-hps/hps_db.public.transactions`
+vers le topic `hps.public.transactions`. Il est **indépendant** du pipeline
+`payments.gold → gold-sink` ci-dessus et démontre la capacité CDC de la
+plateforme ; aucun consommateur n'est branché sur ce topic dans ce PoC.
+
+---
+
+## 13. Monitoring Business — Exporteur & Dashboards Grafana
+
+### 13.1 Exporteur Prometheus (`scripts/hps_exporter.py`)
+
+Sert `/metrics` sur le port **`:8888`**, ciblé par le job Prometheus
+**`swam-business-metrics`** (configuré, cible
+`10.255.255.254:8888` = IP host-gateway de Minikube, joignable depuis les
+pods du cluster).
+
+| Métrique | Labels | Source |
+|----------|--------|--------|
+| `swam_payments_total` | `stage` (raw_encrypted, decrypted, validated, normalized, gold_enriched, dead_letter) | Offset de fin par topic Kafka |
+| `swam_minio_objects` | `layer` (bronze, silver, gold) | Comptage d'objets MinIO par préfixe |
+| `swam_gold_transactions_total` | — | `COUNT(*) FROM gold_transactions` |
+| `swam_gold_risk_score_total` | `risk` (HIGH, MEDIUM, LOW) | `GROUP BY risk_score` |
+| `swam_gold_payment_channel_total` | `channel` (SO_CARTE, SO_MOBILE) | `GROUP BY payment_channel` |
+
+Rafraîchi toutes les `REFRESH_INTERVAL_SECONDS` (défaut 15 s) par un thread de
+fond. Le démarrage complet (environ une minute au maximum) est automatisé :
+
+```bash
+./scripts/start_business_metrics.sh
+# → http://localhost:8888/metrics
+```
+
+Le script active `.venv` ou `venv` lorsqu'il existe, exporte les paramètres
+Kafka/MinIO/PostgreSQL attendus, démarre uniquement les port-forwards absents,
+attend Kafka, l'endpoint MinIO et PostgreSQL, puis vérifie toutes les métriques
+business nécessaires aux dashboards. Les identifiants MinIO ne sont jamais
+stockés dans le script : l'exporteur utilise `MINIO_ACCESS_KEY` et
+`MINIO_SECRET_KEY` lorsqu'ils sont fournis, sinon le Secret Kubernetes
+`minio/minio` (`rootUser`, `rootPassword`). Il découvre également les chemins
+Bronze/Silver/Gold dans le bucket et la table Gold dans PostgreSQL. Pour arrêter l'exporteur et les
+port-forwards qu'il a démarrés :
+
+```bash
+./scripts/stop_business_metrics.sh
+```
+
+### 13.2 Requêtes analytiques (`sql/analytics.sql`)
+
+6 requêtes prêtes à l'emploi sur le data mart (répartition par risque, par
+canal, classement des banques émettrices, taux de transactions à haut risque,
+distribution en %, vue `v_risk_summary`) :
+
+```bash
+PG_POD=$(minikube kubectl -- get pod -n kafka-connect -l app=postgres-datamart -o jsonpath='{.items[0].metadata.name}')
+minikube kubectl -- exec -i -n kafka-connect "$PG_POD" -- psql -U hps -d datamart < sql/analytics.sql
+```
+
+### 13.3 Nouveaux dashboards Grafana
+
+Créés par [`scripts/create_business_dashboards.py`](scripts/create_business_dashboards.py)
+(réutilise les helpers de `create_dashboards.py` — datasource, layout, panels).
+**Ajoutés** aux 7 dashboards existants, aucun n'est modifié/supprimé.
+
+| Dashboard | UID | Tags | Panels |
+|-----------|-----|------|--------|
+| **SWAM - Business Analytics** | `swam-business-analytics` | `hps`, `business`, `poc` | Total transactions (data mart), Gold enrichi (Kafka), répartition par score de risque (piechart + tendance), répartition par canal de paiement (piechart + tendance) |
+| **SWAM - Data Quality** | `swam-data-quality` | `hps`, `business`, `poc` | Transactions validées, rejets DLQ, taux de rejet (%), volumes par étage du pipeline, comptage d'objets MinIO par couche médaillon, débit par étage dans le temps |
+
+Refresh : `30s` · Plage par défaut : `now-1h` → `now`. Accès :
+`http://localhost:3000/d/swam-business-analytics/` et
+`http://localhost:3000/d/swam-data-quality/` (`admin` / K8s Secret `postgres-credentials`).
+
+Régénération :
+
+```bash
+python3 scripts/create_business_dashboards.py
+```
+
+---
+
+## 14. Suppression de l'infrastructure
 
 ```bash
 # Supprimer toute l'infrastructure Terraform
@@ -667,4 +903,3 @@ minikube stop
 ```
 
 ---
-

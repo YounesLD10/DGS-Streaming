@@ -52,3 +52,15 @@ variable "minio_bucket" {
   type        = string
   default     = "rt-payments"
 }
+
+variable "kafka_connect_namespace" {
+  description = "Kubernetes namespace hosting Kafka Connect and the PostgreSQL data mart (pre-existing, created outside Terraform)"
+  type        = string
+  default     = "kafka-connect"
+}
+
+variable "python_runtime_image" {
+  description = "Base image for Terraform-managed Python workloads (kafka-python requires <=3.11; 3.12 breaks its vendored six import)"
+  type        = string
+  default     = "python:3.11-slim"
+}

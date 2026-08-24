@@ -1,0 +1,130 @@
+% ============================================================================
+% frontMatter.tex — dedicaces, remerciements, listes, introduction generale
+% (numerotation romaine ; l'intro generale termine les pages liminaires)
+% ============================================================================
+
+\chapter*{Dedicaces}
+\addcontentsline{toc}{chapter}{Dedicaces}
+
+\vspace{2cm}
+\begin{flushright}
+\textit{
+A nos chers parents, pour leur soutien indefectible et leurs sacrifices\\
+tout au long de notre parcours academique,\\[0.4cm]
+A nos professeurs, pour la qualite de leur enseignement\\
+et la rigueur qu'ils nous ont transmise,\\[0.4cm]
+A toute personne ayant contribue, de pres ou de loin,\\
+a la reussite de ce projet de fin d'annee.
+}
+\end{flushright}
+
+\newpage
+
+\chapter*{Remerciements}
+\addcontentsline{toc}{chapter}{Remerciements}
+
+Nous tenons a exprimer notre profonde gratitude a toutes les personnes qui ont contribue,
+de pres ou de loin, a la reussite de ce projet de fin d'annee.
+
+Nous remercions chaleureusement notre encadrant professionnel, \textbf{M. Haitam BOUTAFI},
+Ingenieur au sein de \textbf{HPS Group Morocco}, pour son encadrement de qualite, sa
+disponibilite constante et ses conseils techniques avises qui ont guide la realisation
+de ce projet d'un bout a l'autre.
+
+Nous remercions egalement notre encadrant pedagogique, \acompleter{[Prenom NOM \textperiodcentered\ Grade]},
+pour son suivi rigoureux et ses recommandations methodologiques tout au long de ce projet.
+
+Nos remerciements s'adressent aussi a l'ensemble du corps professoral et administratif
+de l'EMSI, pour la qualite de la formation dispensee durant ces cinq annees, ainsi qu'a
+\textbf{HPS Group Morocco} pour nous avoir accueillis et permis de travailler sur une
+problematique technique riche et formatrice.
+
+Enfin, nous remercions nos familles et nos proches pour leur soutien moral sans faille.
+
+\newpage
+
+\tableofcontents
+\newpage
+
+\listoffigures
+\addcontentsline{toc}{chapter}{Liste des figures}
+\newpage
+
+\listoftables
+\addcontentsline{toc}{chapter}{Liste des tableaux}
+\newpage
+
+\chapter*{Liste des abreviations}
+\addcontentsline{toc}{chapter}{Liste des abreviations}
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\textwidth}{@{} l X @{}}
+\toprule
+\textbf{Abreviation} & \textbf{Signification} \\
+\midrule
+PFA & Projet de Fin d'Annee \\
+\rowcolor{gray!6} PoC & Proof of Concept \\
+ISO & International Organization for Standardization \\
+\rowcolor{gray!6} MTI & Message Type Indicator (ISO 8583) \\
+PAN & Primary Account Number \\
+\rowcolor{gray!6} CDC & Change Data Capture \\
+JDBC & Java Database Connectivity \\
+\rowcolor{gray!6} SMT & Single Message Transform (Kafka Connect) \\
+PK & Primary Key (cle primaire) \\
+\rowcolor{gray!6} CRD & Custom Resource Definition (Kubernetes) \\
+HA & Haute Disponibilite (High Availability) \\
+\rowcolor{gray!6} PVC & Persistent Volume Claim \\
+KRaft & Kafka Raft (metadata sans ZooKeeper) \\
+\rowcolor{gray!6} AES & Advanced Encryption Standard \\
+HMAC & Hash-based Message Authentication Code \\
+\rowcolor{gray!6} TLS & Transport Layer Security \\
+RBAC & Role-Based Access Control \\
+\bottomrule
+\end{tabularx}
+\caption{Liste des abreviations utilisees}
+\label{tab:abreviations}
+\end{table}
+
+\newpage
+
+% ---- A partir d'ici : numerotation arabe, page 1 --------------------------
+\clearpage
+\pagenumbering{arabic}
+\setcounter{page}{1}
+
+\chapter*{Introduction generale}
+\addcontentsline{toc}{chapter}{Introduction generale}
+
+Le secteur des paiements electroniques connait une croissance soutenue, portee par la
+digitalisation des services bancaires et la multiplication des canaux de paiement
+(carte, mobile, sans contact). Cette croissance s'accompagne d'une exposition accrue
+aux tentatives de fraude, dont la detection efficace constitue un enjeu majeur pour les
+etablissements financiers et les operateurs de switching.
+
+\textbf{HPS Group Morocco}, acteur reconnu de l'edition de solutions monetiques avec sa
+plateforme \textit{PowerCARD}, traite quotidiennement un volume important de transactions
+de paiement. Le systeme de detection de fraude actuellement en production repose sur un
+traitement par lots (\textit{batch}) execute la nuit, ce qui introduit une latence de
+plusieurs heures entre l'occurrence d'une transaction et l'identification d'une eventuelle
+anomalie. Dans le contexte de la fraude bancaire, ou la fenetre d'action utile se mesure
+en secondes, cette latence rend toute intervention corrective largement inoperante.
+
+C'est dans ce contexte que s'inscrit notre projet de fin d'annee, qui consiste a concevoir
+et a realiser une \textbf{preuve de concept (PoC)} d'une plateforme de traitement de
+donnees en temps reel, capable d'ingerer, de valider, d'enrichir et de scorer des
+transactions bancaires au fil de l'eau, en s'appuyant exclusivement sur un ecosysteme
+\textbf{100\% open source} (Apache Kafka, Apache Flink, MinIO, PostgreSQL) deploye sur
+une infrastructure Kubernetes orchestree par Terraform.
+
+Ce rapport est organise en quatre chapitres. Le \textbf{premier chapitre} presente le
+contexte general du projet : l'organisme d'accueil, l'etude de l'existant et la
+methodologie de gestion de projet retenue. Le \textbf{deuxieme chapitre} est consacre a
+l'analyse des besoins fonctionnels et non fonctionnels, ainsi qu'a la modelisation des cas
+d'utilisation. Le \textbf{troisieme chapitre} detaille la conception du systeme, tant sur
+le plan dynamique et statique que sur le plan architectural. Enfin, le \textbf{quatrieme
+chapitre} presente la realisation du projet : l'environnement technique mis en place et
+les interfaces graphiques temoignant du fonctionnement effectif du pipeline.
+
+\newpage

@@ -1,0 +1,199 @@
+% ============================================================================
+% chapitre1.tex — Contexte general du projet
+% ============================================================================
+\chapter{Contexte general du projet}
+\label{chap:contexte}
+
+\introchapitre
+
+Ce premier chapitre situe le projet dans son contexte. Nous presentons d'abord
+l'organisme d'accueil, \textbf{HPS Group Morocco}, puis nous etudions le systeme de
+detection de fraude actuellement en production afin d'en degager les limites. Nous
+exposons ensuite la solution proposee, la methodologie de gestion de projet retenue,
+ainsi que le planning et les outils mobilises.
+
+\section{Presentation de l'organisme d'accueil}
+\label{sec:organisme}
+
+\textbf{HPS Group} (Hightech Payment Systems) est un editeur et integrateur de
+solutions monetiques fonde en 1995 et dont le siege social est situe a Casablanca,
+au Maroc. Specialiste des paiements electroniques, HPS Group accompagne banques,
+emetteurs, switchs nationaux et commercants a travers sa plateforme phare
+\textit{PowerCARD}, qui couvre l'ensemble de la chaine de valeur monetique :
+emission, acquisition, switching et gestion des cartes de paiement.
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Champ} & \textbf{Information} \\
+\hline
+Raison sociale & HPS Group (Hightech Payment Systems) \\
+\hline
+Secteur d'activite & Paiements electroniques / Monetique \\
+\hline
+Siege social & Casablanca, Maroc \\
+\hline
+Activite principale & Edition de solutions de switching et de routage de paiements \\
+\hline
+Annee de fondation & 1995 \\
+\hline
+Effectif & $\sim$500 employes \\
+\hline
+Produit phare & PowerCARD \\
+\hline
+\end{tabular}
+\caption{Fiche technique de HPS Group}
+\label{tab:fiche-hps}
+\end{table}
+
+Le present projet a ete realise au sein de l'entite \textbf{HPS Group Morocco}, dans
+le cadre d'un stage de fin d'annee oriente vers l'exploration de solutions de traitement
+de donnees en temps reel applicables a la detection de fraude bancaire.
+
+\section{Etude de l'existant}
+\label{sec:existant}
+
+\subsection{Description de l'existant}
+
+Le systeme de detection de fraude actuellement en production repose sur un
+\textbf{pipeline de traitement par lots (batch)} execute chaque nuit. L'ensemble des
+transactions de la journee est accumule, puis traite en une seule passe a heure fixe,
+produisant des resultats consultables uniquement le lendemain matin. Ce mode de
+fonctionnement introduit une \textbf{latence de plusieurs heures} entre l'occurrence
+d'une transaction et la detection d'une eventuelle anomalie.
+
+\subsection{Critique de l'existant}
+
+Cette architecture batch presente plusieurs limites majeures, resumees dans le tableau
+\ref{tab:limites-existant} :
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\textwidth}{@{} l X @{}}
+\toprule
+\textbf{Limite identifiee} & \textbf{Impact concret} \\
+\midrule
+Latence de plusieurs heures & Fraude detectee bien apres l'autorisation, transaction irreversible \\
+\rowcolor{gray!6}
+Traitement nocturne unique & Aucune visibilite sur les transactions en cours de journee \\
+Absence de reaction immediate & Impossible de bloquer ou d'escalader une transaction suspecte a temps \\
+\rowcolor{gray!6}
+Accumulation de donnees non analysees & Volume croissant de transactions en attente d'un traitement differe \\
+Pas de monitoring temps reel & Incidents operationnels detectes avec retard \\
+\bottomrule
+\end{tabularx}
+\caption{Limites du systeme de traitement existant}
+\label{tab:limites-existant}
+\end{table}
+
+Dans le domaine des paiements electroniques, ou la fenetre d'action utile face a une
+fraude se mesure en secondes, ce delai rend toute intervention corrective largement
+inoperante : une transaction frauduleuse autorisee a 14h00 n'est identifiee comme
+suspecte que le lendemain, alors que les fonds ont deja ete debites de maniere
+definitive.
+
+\subsection{Solution proposee}
+
+Face a ces constats, nous proposons de concevoir un \textbf{pipeline de streaming
+temps reel}, deploye sur une infrastructure Kubernetes et reposant exclusivement sur
+des technologies \textbf{open source} :
+
+\begin{itemize}
+    \item \textbf{Apache Kafka} (distribution Strimzi) pour l'ingestion et le transport
+    des evenements de paiement,
+    \item \textbf{Apache Flink} (PyFlink) pour le traitement en continu --- decryptage,
+    validation, normalisation, optimisation,
+    \item \textbf{MinIO} pour la persistance des donnees selon une architecture
+    medaillon (Bronze / Silver / Gold),
+    \item \textbf{PostgreSQL}, alimente via un connecteur Kafka Connect JDBC Sink,
+    pour la persistance finale exploitable par les outils d'analyse,
+    \item \textbf{Prometheus} et \textbf{Grafana} pour l'observabilite temps reel de
+    l'ensemble du pipeline.
+\end{itemize}
+
+Cette solution permet de traiter chaque transaction en quelques secondes, contre
+plusieurs heures pour le pipeline batch existant, tout en restant entierement
+decouplee de l'infrastructure de production --- garantissant ainsi un PoC sans aucun
+impact sur les systemes existants.
+
+\section{Choix du modele de developpement}
+\label{sec:scrum}
+
+Nous avons retenu la methodologie \textbf{Scrum} pour la gestion de ce projet. Ce choix
+se justifie par la nature exploratoire du PoC : les briques technologiques (Kafka,
+Flink, Kafka Connect) necessitaient des iterations courtes pour valider chaque
+hypothese technique avant de passer a la suivante. Le travail a ete organise en
+sprints courts, rythmes par un backlog priorise et des points d'avancement reguliers
+permettant d'ajuster rapidement les choix d'architecture.
+
+\section{Planning previsionnel}
+\label{sec:planning}
+
+Le tableau \ref{tab:planning} synthetise le planning previsionnel du sprint principal
+de mise en place du pipeline.
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\textwidth}{@{} l l X @{}}
+\toprule
+\textbf{Jour} & \textbf{Periode} & \textbf{Objectifs} \\
+\midrule
+Jour 1 & 20 avril 2026 & Provisionnement Terraform, cluster Kafka (Strimzi), namespaces Kubernetes \\
+\rowcolor{gray!6}
+Jour 2 & 21 avril 2026 & Developpement des jobs Flink 1 et 2 (decryptage, validation ISO) \\
+Jour 3 & 22 avril 2026 & Developpement des jobs Flink 3 et 4 (normalisation, optimisation/scoring) \\
+\rowcolor{gray!6}
+Jour 4 & 23 avril 2026 & Integration MinIO (medaillon), Kafka Connect, JDBC Sink, PostgreSQL \\
+Jour 5 & 24 avril 2026 & Mise en place du monitoring Prometheus/Grafana, tests de bout en bout \\
+\bottomrule
+\end{tabularx}
+\caption{Planning previsionnel du sprint (5 jours, 20--24 avril 2026)}
+\label{tab:planning}
+\end{table}
+
+\section{Outils et technologies}
+\label{sec:outils}
+
+Le tableau \ref{tab:outils-ch1} liste les principaux outils et technologies retenus
+pour la realisation de ce PoC, tous open source.
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\textwidth}{@{} l X @{}}
+\toprule
+\textbf{Outil / Technologie} & \textbf{Role dans le projet} \\
+\midrule
+Apache Kafka (Strimzi) & Bus d'evenements distribue, transport des transactions entre etapes \\
+\rowcolor{gray!6}
+Apache Flink (PyFlink) & Traitement de flux en continu (decryptage, validation, normalisation, scoring) \\
+MinIO & Stockage objet S3-compatible, architecture medaillon Bronze/Silver/Gold \\
+\rowcolor{gray!6}
+PostgreSQL & Base de donnees relationnelle, persistance finale (\texttt{gold\_transactions}) \\
+Kafka Connect (Debezium JDBC Sink) & Connecteur assurant le transfert Kafka -> PostgreSQL \\
+\rowcolor{gray!6}
+Prometheus & Collecte et stockage des metriques du pipeline \\
+Grafana & Visualisation et tableaux de bord temps reel \\
+\rowcolor{gray!6}
+Terraform & Infrastructure as Code, provisionnement reproductible du cluster \\
+Kubernetes (Minikube) & Orchestration des conteneurs, environnement de developpement local \\
+\rowcolor{gray!6}
+Python & Langage principal (producteur, jobs PyFlink, scripts d'integration) \\
+Docker & Conteneurisation des composants du pipeline \\
+\bottomrule
+\end{tabularx}
+\caption{Outils et technologies utilises}
+\label{tab:outils-ch1}
+\end{table}
+
+\conclusionchapitre
+
+Ce chapitre a permis de poser le contexte du projet : un organisme d'accueil reconnu
+dans le secteur monetique, un systeme de detection de fraude existant penalise par une
+latence batch incompatible avec les exigences du temps reel, et une solution proposee
+fondee sur un ecosysteme open source de streaming. Le chapitre suivant approfondit
+l'analyse des besoins fonctionnels et non fonctionnels du systeme a concevoir.

@@ -1,0 +1,148 @@
+% ============================================================================
+% preambule.tex — packages, couleurs, styles de titres, en-tete, legendes
+% ============================================================================
+
+\usepackage[a4paper, top=3.18cm, bottom=3.18cm, left=2.54cm, right=2.54cm,
+            headheight=1.25cm]{geometry}
+
+% --- Polices (XeLaTeX + fontspec) ------------------------------------------
+\usepackage{fontspec}
+\setmainfont{Times New Roman}
+\newfontfamily\headfont{Arial}
+\setsansfont{Arial}
+
+\usepackage{xcolor}
+\usepackage[french]{babel}
+\frenchspacing
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{colortbl}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{calc}
+\usepackage{setspace}
+\usepackage{parskip}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{ragged2e}
+\usepackage{etoolbox}
+\usepackage{pdfpages}
+
+\setstretch{1.5}
+\setlength{\parindent}{0.8cm}
+\justifying
+
+% --- Couleurs EMSI ----------------------------------------------------------
+\definecolor{EMSIvert}{HTML}{1B5E20}
+\definecolor{EMSIvertMoyen}{HTML}{2E7D32}
+\definecolor{EMSIvertClair}{HTML}{E8F5E9}
+\definecolor{texteGris}{HTML}{404040}
+\definecolor{EMSIvertBanniere}{HTML}{00B050}
+
+\color{texteGris}
+
+% --- Numerotation des chapitres : "Chapitre N" -----------------------------
+\renewcommand{\thechapter}{\arabic{chapter}}
+
+% --- Titre 1 (chapitre) : fond vert, texte blanc, Arial 18pt gras ----------
+\titleformat{\chapter}[block]
+  {\headfont\fontsize{18}{22}\selectfont\bfseries\color{white}}
+  {}
+  {0pt}
+  {%
+    \begin{tikzpicture}[remember picture, overlay]
+      \node[fill=EMSIvert, anchor=north west, minimum width=\textwidth,
+            minimum height=1.6cm, text width=\textwidth-0.6cm,
+            align=left, inner sep=0.3cm]
+        at ($(current page.north west)+(2.54cm,-3.0cm)$)
+        {\headfont\fontsize{18}{22}\selectfont\bfseries\color{white}%
+         Chapitre \thechapter\ ---\ #1};
+    \end{tikzpicture}%
+    \vspace{1.4cm}%
+  }
+\titlespacing*{\chapter}{0pt}{0pt}{30pt}
+
+% --- Titre 2 (section) : vert fonce, Arial 13pt gras -----------------------
+\titleformat{\section}
+  {\headfont\fontsize{13}{16}\selectfont\bfseries\color{EMSIvert}}
+  {\thesection\ ---\ }
+  {0pt}
+  {}
+\titlespacing*{\section}{0pt}{16pt}{8pt}
+
+% --- Titre 3 (sous-section) : vert moyen, Arial 12pt gras ------------------
+\titleformat{\subsection}
+  {\headfont\fontsize{12}{15}\selectfont\bfseries\color{EMSIvertMoyen}}
+  {\thesubsection\ ---\ }
+  {0pt}
+  {}
+\titlespacing*{\subsection}{0pt}{12pt}{6pt}
+
+\titleformat{\subsubsection}
+  {\headfont\fontsize{11}{14}\selectfont\bfseries\itshape\color{EMSIvertMoyen}}
+  {\thesubsubsection\ ---\ }
+  {0pt}
+  {}
+\titlespacing*{\subsubsection}{0pt}{10pt}{4pt}
+
+% --- Sections non numerotees "Introduction" / "Conclusion" de chapitre ----
+\newcommand{\introchapitre}{%
+  \section*{Introduction}
+  \addcontentsline{toc}{section}{Introduction}
+}
+\newcommand{\conclusionchapitre}{%
+  \section*{Conclusion}
+  \addcontentsline{toc}{section}{Conclusion}
+}
+
+% --- En-tete / pied de page --------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\headfont Rapport de Projet de Fin d'Annee --- 5\textsuperscript{eme} IIR}
+\fancyhead[R]{\small\headfont\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\fancypagestyle{plain}{%
+  \fancyhf{}
+  \renewcommand{\headrulewidth}{0pt}
+}
+
+% --- Legendes : figures sous l'image, tableaux au-dessus -------------------
+\captionsetup[figure]{position=below, labelsep=colon, name=Figure,
+  font={small,sf}, labelfont={bf,sf}, justification=centering}
+\captionsetup[table]{position=above, labelsep=colon, name=Tableau,
+  font={small,sf}, labelfont={bf,sf}, justification=centering}
+
+% --- Listes : item se termine par "," sauf le dernier par "." --------------
+\setlist[itemize]{label=--, leftmargin=1.2cm, itemsep=2pt}
+
+% --- Hyperref (liens cliquables, sans cadres voyants) -----------------------
+\hypersetup{
+  colorlinks=true,
+  linkcolor=EMSIvert,
+  citecolor=EMSIvert,
+  urlcolor=EMSIvertMoyen,
+  bookmarksopen=true,
+  pdftitle={Conception et Realisation d'un PoC de Streaming Temps Reel pour la Detection de Fraude Bancaire},
+  pdfauthor={Asmae ABIDINE}
+}
+
+% --- Numerotation romaine puis arabe (geree dans main.tex) ------------------
+
+% --- Placeholder visible pour figure manquante ------------------------------
+\newcommand{\figuremanquante}[1]{%
+  \begin{center}
+  \fbox{\parbox{12cm}{\centering\vspace{2cm}Figure a inserer : #1\vspace{2cm}}}
+  \end{center}
+}
+
+% --- Placeholder texte rouge pour info a completer --------------------------
+\newcommand{\acompleter}[1]{\textit{\textcolor{red}{#1}}}

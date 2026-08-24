@@ -1,0 +1,33 @@
+%%{init: {'theme': 'neutral'}}%%
+stateDiagram-v2
+    [*] --> Produced
+
+    Produced: Produced\n(read from Kaggle CSV)
+    Encrypted: Encrypted\n(Fernet AES-128-CBC + HMAC-SHA256)
+    Published: Published to Kafka\n(topic: payments)
+    Decrypted: Decrypted\n(Job1 · bronze/ written)
+    Validated: Validated\n(Job2 · 9 ISO/structural rules passed)
+    Normalized: Normalized & Enriched\n(Job3 · silver/ written, ISO 4217/MCC/scheme)
+    Optimized: Scored & Deduplicated\n(Job4 · gold/ written, risk score, ValueState dedup)
+    Synced: Synced to Data Mart\n(gold-sink → fact_transactions UPSERT)
+    Rejected: Rejected\n(routed to payments.dlq with reason code)
+
+    Produced --> Encrypted
+    Encrypted --> Published
+    Published --> Decrypted : Fernet token valid
+    Published --> Rejected : InvalidToken / tampered
+
+    Decrypted --> Validated : passes MTI, amount,\ncurrency, Luhn checks
+    Decrypted --> Rejected : fails any of 9 rules\n(reason code attached)
+
+    Validated --> Normalized
+    Normalized --> Optimized
+    Optimized --> Synced
+
+    Synced --> [*]
+    Rejected --> [*]
+
+    note right of Rejected
+        Stored for 72h in payments.dlq
+        for replay / analyst debugging
+    end note

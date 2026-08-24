@@ -1,0 +1,61 @@
+%%{init: {'theme': 'neutral'}}%%
+flowchart LR
+    CSV[("Kaggle CSV\ncreditcard.csv")]
+    PROD["Producer (Python)\nFernet encrypt + CDC envelope"]
+
+    subgraph KAFKA["Kafka — namespace: kafka (Strimzi KRaft 4.1.0)"]
+        T_IN["topic: payments"]
+        T_DLQ["topic: payments.dlq"]
+        T_GOLD["topic: payments.gold"]
+    end
+
+    subgraph FLINK["Flink — namespace: flink (Session Cluster 1.19.1)"]
+        J1["Job 1 — Decrypt"]
+        J2["Job 2 — Validate"]
+        J3["Job 3 — Normalize"]
+        J4["Job 4 — Optimize / Enrich"]
+    end
+
+    subgraph MINIO["MinIO — namespace: minio (bucket: rt-payments)"]
+        BRONZE[("bronze/")]
+        SILVER[("silver/")]
+        GOLD[("gold/")]
+    end
+
+    subgraph SINK["Data Mart — namespace: kafka-connect"]
+        GS["gold-sink\n(custom Python consumer)"]
+        PG[("PostgreSQL\nfact_transactions")]
+    end
+
+    subgraph MON["Monitoring — namespace: monitoring"]
+        EXP["Business metrics exporter\n:8888/metrics"]
+        PROM["Prometheus"]
+        GRAF["Grafana dashboard"]
+    end
+
+    CSV --> PROD --> T_IN
+    T_IN --> J1 --> BRONZE
+    J1 --> J2 --> J3 --> SILVER
+    J3 --> J4 --> GOLD
+    J4 --> T_GOLD
+    J1 -. "decrypt error" .-> T_DLQ
+    J2 -. "validation error" .-> T_DLQ
+
+    T_GOLD --> GS --> PG
+
+    PROM -- "scrape /metrics" --> J1
+    PROM -- "scrape" --> EXP
+    PROM -- "scrape" --> MINIO
+    EXP -. "reads counts" .-> KAFKA
+    EXP -. "reads counts" .-> MINIO
+    EXP -. "reads counts" .-> PG
+    GRAF -- "PromQL queries" --> PROM
+
+    classDef kafka fill:#fde2e2,stroke:#c0392b
+    classDef flink fill:#e2ecfd,stroke:#2c5fa8
+    classDef minio fill:#e6f4ea,stroke:#2e7d32
+    classDef mon fill:#fff3cd,stroke:#a67c00
+    class T_IN,T_DLQ,T_GOLD kafka
+    class J1,J2,J3,J4 flink
+    class BRONZE,SILVER,GOLD minio
+    class EXP,PROM,GRAF mon

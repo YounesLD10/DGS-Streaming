@@ -1,0 +1,37 @@
+%%{init: {'theme': 'neutral'}}%%
+flowchart TD
+    START(["Receive decrypted\ntransaction record"])
+
+    R1{"① MESSAGE_TYPE present\n& exactly 4 digits?"}
+    R2{"② TRANSACTION_AMOUNT\npresent, numeric, > 0?"}
+    R3{"③④⑤ CURRENCY, ISSUING_BANK,\nCARD_TYPE present?"}
+    R4{"⑥ REJECT_CODE\nempty?"}
+    R5{"⑦ ISO 8583 — MTI\nin known message-type set?"}
+    R6{"⑧ ISO 4217 — currency\nin ISO dictionary?"}
+    R7{"⑨ ISO 7812 — Luhn check\non CARD_NUMBER (≥12 digits)?"}
+
+    OK(["Emit to payments.validated"])
+    KO(["Emit to payments.dlq\nwith reason code\n(e.g. ISO7812_LUHN_FAILED)"])
+
+    START --> R1
+    R1 -- "no → MISSING/INVALID_MESSAGE_TYPE" --> KO
+    R1 -- yes --> R2
+    R2 -- "no → MISSING/INVALID/NOT_POSITIVE" --> KO
+    R2 -- yes --> R3
+    R3 -- "no → MISSING_*" --> KO
+    R3 -- yes --> R4
+    R4 -- "no → REJECTED_BY_BANK" --> KO
+    R4 -- yes --> R5
+    R5 -- "no → ISO8583_UNKNOWN_MTI" --> KO
+    R5 -- yes --> R6
+    R6 -- "no → ISO4217_INVALID_CURRENCY" --> KO
+    R6 -- yes --> R7
+    R7 -- "no → ISO7812_LUHN_FAILED" --> KO
+    R7 -- yes --> OK
+
+    classDef rule fill:#e2ecfd,stroke:#2c5fa8,color:#000
+    classDef good fill:#e6f4ea,stroke:#2e7d32,color:#000
+    classDef bad fill:#fde2e2,stroke:#c0392b,color:#000
+    class R1,R2,R3,R4,R5,R6,R7 rule
+    class OK good
+    class KO bad

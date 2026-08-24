@@ -80,11 +80,11 @@ def main():
     total = len(df)
     print(f"[producer] Rows to send: {total}  rate: {args.rate} msg/s  topic: {args.topic}")
 
-    if CARD_NUMBER_COL in df.columns:
-        df[CARD_NUMBER_COL] = df[CARD_NUMBER_COL].apply(mask_card_number)
-        print(f"[producer] CARD_NUMBER masking applied.")
-    else:
+    if CARD_NUMBER_COL not in df.columns:
         print(f"[producer] WARNING: column '{CARD_NUMBER_COL}' not found — no masking applied.")
+    # Do NOT mask CARD_NUMBER before encryption. Fernet encrypts the full PAN at
+    # rest and in transit; masking before encryption destroys Luhn validation
+    # downstream (Job2 Rule ⑨). Masking is applied only for display/logging.
 
     producer = make_producer(args.bootstrap)
     interval = 1.0 / args.rate

@@ -1,0 +1,387 @@
+% ============================================================
+% CHAPITRE 2 : Analyse et Conception
+% Projet : Pipeline de Streaming Temps Réel --- HPS Group
+% Auteure : Asmae ABIDINE
+% ============================================================
+
+{\begin{center}\includegraphics[width=0.6\textwidth]{chapter2.png}\end{center}}
+
+\mysection{Chapitre 2}{Analyse et Conception}
+
+\vspace{0.5cm}
+\flushleft
+
+% ============================================================
+\subsection*{Introduction}
+\phantomsection
+\addcontentsline{toc}{subsection}{Introduction}
+\vspace{0.5cm}
+
+La réussite d'un projet d'ingénierie des données repose avant tout sur une analyse rigoureuse des besoins et une conception architecturale solide. Dans le cadre du développement de la plateforme de streaming temps réel pour HPS Group, cette étape préliminaire est d'autant plus critique que le système doit traiter des transactions financières sensibles en temps réel, tout en garantissant fiabilité, sécurité et performance.
+\\[0.3cm]
+Ce chapitre présente l'analyse complète des besoins du système, en distinguant les exigences fonctionnelles --- ce que le système doit faire --- des exigences non fonctionnelles --- comment il doit le faire. Cette distinction est essentielle pour orienter les choix architecturaux et technologiques qui seront détaillés dans les chapitres suivants.
+\\[0.3cm]
+Dans un second temps, ce chapitre aborde la conception du système à travers cinq diagrammes UML standards : le diagramme de cas d'utilisation, qui modélise les interactions entre les acteurs et le système ; le diagramme de classes, qui décrit la structure statique des entités et leurs relations ; le diagramme de séquence, qui illustre le flux dynamique d'une transaction au travers des quatre jobs Flink ; le diagramme d'activité, qui détaille le flux décisionnel des 9 règles de validation ; et le diagramme d'états, qui modélise le cycle de vie complet d'une transaction.
+\\[0.3cm]
+L'ensemble de cette démarche permet de poser les fondations techniques et fonctionnelles nécessaires à la réalisation d'un pipeline de streaming robuste, capable de détecter les fraudes en moins de 5 secondes, en parfaite complémentarité avec le pipeline batch nocturne existant de HPS Group.
+
+\clearpage
+\newpage
+
+% ============================================================
+\subsection{Analyse et Spécification des Besoins}
+\vspace{0.5cm}
+
+\subsubsection{Spécification des Besoins Non Fonctionnels}
+\vspace{0.3cm}
+
+Les besoins non fonctionnels définissent les contraintes de qualité et de performance que le système doit respecter, indépendamment des fonctionnalités métier. Pour un pipeline de traitement de transactions financières en temps réel, ces exigences sont particulièrement critiques.
+
+\vspace{0.3cm}
+\begin{itemize}[leftmargin=1.5cm]
+
+    \item \textbf{Performance et latence} : Le pipeline doit garantir une latence end-to-end inférieure à 5 secondes entre la réception d'une transaction dans Kafka et son écriture dans la couche Gold de MinIO. Chaque job Flink doit traiter les enregistrements en flux continu sans accumulation de backpressure. Le système doit supporter un débit minimal de 1\,000 transactions par seconde.
+
+    \item \textbf{Disponibilité et tolérance aux pannes} : Le pipeline doit fonctionner en continu, 24h/24 et 7j/7, sans interruption de service. Apache Flink est configuré avec un mécanisme de checkpointing en mode \texttt{EXACTLY\_ONCE} toutes les 30 secondes, garantissant la reprise automatique après une panne sans perte ni duplication de données.
+
+    \item \textbf{Fiabilité et cohérence des données} : Le système doit garantir qu'aucune transaction valide n'est perdue durant le traitement. La Dead Letter Queue (DLQ) assure que les enregistrements invalides ou non traitables sont isolés et traçables sans bloquer le flux principal. Le mécanisme de déduplication par \texttt{AUTHORIZATION\_CODE} via le Flink KeyedState élimine les doublons de façon distribuée et persistante.
+
+    \item \textbf{Sécurité et confidentialité} : Toutes les données de transaction sont chiffrées avec l'algorithme Fernet (AES-128-CBC + HMAC-SHA256) avant publication dans Kafka. Le numéro de carte (\texttt{CARD\_NUMBER}) est systématiquement masqué selon le format \texttt{123456******3456} avant tout traitement ou stockage. Les communications inter-namespaces Kubernetes sont contrôlées par des NetworkPolicies restrictives. Les accès à MinIO et aux services internes sont sécurisés par authentification.
+
+    \item \textbf{Scalabilité} : L'architecture Kubernetes permet de faire évoluer horizontalement le nombre de TaskManagers Flink et le nombre de réplicas Kafka selon la charge. L'architecture Medallion (Bronze/Silver/Gold) est conçue pour absorber des volumes croissants de données sans modification structurelle.
+
+    \item \textbf{Maintenabilité et observabilité} : L'ensemble de l'infrastructure est défini en Infrastructure as Code via Terraform, garantissant la reproductibilité des déploiements. Chaque job Flink est identifié par un UID unique (\texttt{.uid()}) permettant la sauvegarde et la restauration des états. Les logs structurés permettent le débogage et le monitoring du pipeline.
+
+    \item \textbf{Non-interférence avec l'existant} : Le pipeline temps réel est déployé en parallèle du pipeline batch nocturne existant, dans des namespaces Kubernetes isolés, sans aucune modification ni interaction avec les systèmes de production HPS.
+
+    \item \textbf{Portabilité} : La solution est conçue pour fonctionner sur Minikube en environnement de développement (PoC) et peut être migrée vers Azure Kubernetes Service (AKS) pour la mise en production, sans modification du code applicatif.
+
+\end{itemize}
+
+\newpage
+
+% ============================================================
+\subsubsection{Spécification des Besoins Fonctionnels}
+\vspace{0.3cm}
+
+Les besoins fonctionnels décrivent les capacités que le système doit offrir pour répondre aux objectifs métier de HPS Group. Ils sont organisés par couche architecturale, conformément à l'architecture Medallion adoptée.
+
+\vspace{0.3cm}
+\textbf{1. Couche Ingestion --- Apache Kafka}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{Réception des transactions} : Le système doit recevoir en continu les transactions de paiement provenant des sources SO Carte et SO Mobile via un connecteur Kafka Connect avec Debezium (CDC) ou un producer Python.
+    \item \textbf{Chiffrement des données} : Chaque transaction doit être chiffrée avec Fernet avant publication dans le topic Kafka \texttt{payments}, et le numéro de carte doit être masqué selon la norme PCI-DSS.
+    \item \textbf{Gestion des topics} : Le système doit maintenir les six topics suivants avec rétention explicite : \texttt{payments}, \texttt{payments.decrypted}, \texttt{payments.validated}, \texttt{payments.normalized}, \texttt{payments.gold} et \texttt{payments.dlq}.
+    \item \textbf{Persistance des messages} : Les messages doivent être conservés 24 heures dans les topics de traitement, 7 jours dans \texttt{payments.gold} et 72 heures dans la DLQ pour permettre une analyse des erreurs.
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{2. Couche Traitement --- Apache Flink}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{Job 1 --- Décryption} : Le système doit déchiffrer le payload Fernet de chaque message et écrire l'enregistrement brut dans la couche Bronze de MinIO. Tout échec de déchiffrement doit être routé vers la DLQ avec le motif d'erreur. Le payload chiffré ne doit jamais figurer dans les messages DLQ.
+
+    \item \textbf{Job 2 --- Validation} : Le système doit appliquer 9 règles de validation en une seule passe sur chaque transaction décryptée. Les 6 règles métier HPS sont :
+        \begin{itemize}
+            \item \texttt{MESSAGE\_TYPE} : non nul et exactement 4 chiffres décimaux.
+            \item \texttt{TRANSACTION\_AMOUNT} : non nul, numérique et strictement positif.
+            \item \texttt{TRANSACTION\_CURRENCY} : non nul et non vide.
+            \item \texttt{ISSUING\_BANK} : non nul et non vide.
+            \item \texttt{CARD\_TYPE} : non nul et non vide.
+            \item \texttt{REJECT\_CODE} : doit être vide ou absent.
+        \end{itemize}
+        Les 3 règles de conformité ISO bancaire sont :
+        \begin{itemize}
+            \item \textbf{ISO 8583} : \texttt{MESSAGE\_TYPE} doit correspondre à un MTI reconnu (ex. : 1100 = Authorization Request).
+            \item \textbf{ISO 4217} : \texttt{TRANSACTION\_CURRENCY} doit être un code devise valide (ex. : 504 = MAD, 840 = USD).
+            \item \textbf{ISO 7812 --- Luhn} : \texttt{CARD\_NUMBER} doit passer la vérification mod-10 (algorithme de Luhn).
+        \end{itemize}
+    Toute transaction invalide est envoyée vers \texttt{payments.dlq} avec un code de rejet machine-readable.
+
+    \item \textbf{Job 3 --- Normalisation et enrichissement} : Le système doit convertir tous les champs date du format \texttt{DD/MM/YYYY HH:MM} vers le format ISO 8601, convertir les montants en notation scientifique européenne (\texttt{0,11E+02}) en nombres décimaux, et enrichir chaque enregistrement avec les métadonnées suivantes : \texttt{processed\_at}, \texttt{source\_system}, \texttt{pipeline\_version}, \texttt{card\_scheme} (VISA/Mastercard/AMEX), \texttt{mti\_name}, \texttt{currency\_alpha} et \texttt{mcc\_description}.
+
+    \item \textbf{Job 4 --- Optimisation} : Le système doit dédupliquer les transactions par \texttt{AUTHORIZATION\_CODE} via un état Flink distribué (ValueState), router chaque transaction vers le canal approprié (\texttt{SO\_CARTE} si \texttt{PRODUCT\_CODE = 6}, sinon \texttt{SO\_MOBILE}), attribuer un score de risque (\texttt{HIGH}, \texttt{MEDIUM} ou \texttt{LOW}) selon les règles métier définies, et publier le résultat dans le topic \texttt{payments.gold}.
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{3. Couche Stockage --- MinIO (Architecture Medallion)}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{Bronze} : Stocker les données brutes déchiffrées telles qu'issues de Kafka, pour des fins d'audit et de rejeu.
+    \item \textbf{Silver} : Stocker les données validées, normalisées et enrichies avec les dates en ISO 8601 et les montants convertis.
+    \item \textbf{Gold} : Stocker les données finales dédupliquées, incluant le canal de paiement, le score de risque et les enrichissements ISO.
+    \item \textbf{DLQ} : Conserver toutes les transactions invalides ou non traitables avec leur motif de rejet, sans données sensibles.
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{4. Couche Analytique --- Data Mart PostgreSQL}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{Alimentation automatique} : Le Data Mart doit être alimenté en temps réel depuis le topic \texttt{payments.gold} via un connecteur Kafka Connect JDBC Sink.
+    \item \textbf{Schéma en étoile} : Le Data Mart doit implémenter un schéma en étoile avec une table de faits \texttt{fact\_transactions} et quatre tables de dimensions : \texttt{dim\_risk}, \texttt{dim\_canal}, \texttt{dim\_banque} et \texttt{dim\_date}.
+    \item \textbf{Interrogation SQL} : Le Data Mart doit permettre des requêtes analytiques sur les scores de risque, les canaux de paiement et les tendances temporelles.
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{5. Couche Infrastructure --- Kubernetes / Terraform}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{Déploiement automatisé} : L'ensemble de l'infrastructure (namespaces, services, déploiements) doit être provisionnable via une seule commande Terraform.
+    \item \textbf{Isolation} : Les composants Kafka, Flink, MinIO et Data Mart doivent être isolés dans des namespaces Kubernetes dédiés avec des NetworkPolicies restrictives.
+    \item \textbf{Script de déploiement} : Un script \texttt{deploy\_infrastructure.sh} doit permettre le déploiement complet de l'environnement en une seule étape.
+\end{itemize}
+
+\newpage
+
+% ============================================================
+\subsection{Conception}
+\vspace{0.5cm}
+
+% ============================================================
+\subsubsection{Diagramme de Cas d'Utilisation}
+\vspace{0.3cm}
+
+Le diagramme de cas d'utilisation global modélise les interactions entre les différents acteurs du système et les fonctionnalités offertes par la plateforme de streaming temps réel.
+
+\vspace{0.3cm}
+\textbf{Identification des acteurs}
+
+\begin{table}[H]
+\hspace*{-1.1cm}
+  \centering
+  \renewcommand{\arraystretch}{1.5}
+  \begin{tabular}{|l|p{12cm}|}
+\hline
+\textbf{Acteur} & \textbf{Responsabilités principales} \\
+\hline
+\textbf{Data Engineer} &
+\begin{itemize}
+    \item Configurer et lancer le Producer Python pour lire et chiffrer les transactions depuis la source CSV.
+    \item Déployer et soumettre les 4 jobs Flink de traitement (décryption, validation, normalisation, optimisation).
+    \item Gérer les topics Kafka, les connecteurs et le service \texttt{gold-sink} vers le Data Mart.
+    \item Surveiller le pipeline via le tableau de bord Grafana et l'exporteur de métriques métier.
+\end{itemize} \\
+\hline
+\textbf{Administrateur} &
+\begin{itemize}
+    \item Déployer et gérer l'infrastructure via Terraform.
+    \item Surveiller l'état des jobs via le Flink Dashboard (\texttt{http://localhost:8081}).
+    \item Consulter les données dans MinIO Console et gérer les topics Kafka.
+    \item Gérer les connecteurs Kafka Connect (Source et Sink).
+\end{itemize} \\
+\hline
+\textbf{Data Analyste} &
+\begin{itemize}
+    \item Interroger le Data Mart PostgreSQL via SQL pour des analyses métier en temps réel.
+    \item Consulter les scores de risque (\texttt{HIGH}/\texttt{MEDIUM}/\texttt{LOW}) et les canaux de paiement (\texttt{SO\_CARTE}/\texttt{SO\_MOBILE}).
+    \item Accéder aux données Gold pour le reporting réglementaire et les indicateurs de performance.
+    \item Visualiser les tableaux de bord Grafana alimentés en temps réel par le pipeline.
+\end{itemize} \\
+\hline
+\end{tabular}
+  \caption{Acteurs et responsabilités dans la plateforme de streaming temps réel}
+  \label{tab:acteurs}
+\end{table}
+
+\vspace{0.3cm}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{useCaseGlobal_v3.png}
+  \caption{Diagramme de cas d'utilisation global --- Plateforme de Streaming Temps Réel HPS}
+  \label{fig:useGlob}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsubsection{Diagramme de Classes}
+\vspace{0.3cm}
+
+Le diagramme de classes modélise la structure statique des entités principales du système et leurs relations. Il représente les objets manipulés tout au long du pipeline de traitement, depuis la réception du message Kafka jusqu'au stockage dans la couche Gold.
+
+\vspace{0.3cm}
+\textbf{Description des classes principales}
+
+\begin{itemize}[leftmargin=1.5cm]
+
+    \item \textbf{DataEngineer} : Représente l'acteur technique responsable de l'ensemble du pipeline. Il agrège les responsabilités d'ingestion (lancement du Producer, chiffrement Fernet), de traitement (soumission des jobs Flink), de supervision (Grafana, métriques) et de maintenance de l'infrastructure Kubernetes via Terraform.
+
+    \item \textbf{FlinkJob} : Classe abstraite représentant un job Flink générique du pipeline. Elle définit les attributs communs à tous les jobs : \texttt{jobId}, \texttt{sourceTopic}, \texttt{sinkTopic} et \texttt{checkpointIntervalMs}. Elle expose les méthodes \texttt{open()}, \texttt{process\_element()} et \texttt{execute()}. Quatre classes concrètes en héritent : \texttt{DecryptJob}, \texttt{ValidateJob}, \texttt{NormalizeJob} et \texttt{OptimizeJob}.
+
+    \item \textbf{KafkaEnvelope} : Représente le message Kafka publié par le Producer. Elle contient l'identifiant de l'événement (\texttt{eventId}), la table source (\texttt{table}), l'opération (\texttt{operation}), le payload chiffré Fernet (\texttt{payload}) et l'horodatage (\texttt{timestamp}).
+
+    \item \textbf{Transaction} : Représente les données de transaction HPS après déchiffrement par le Job 1. Elle contient l'ensemble des champs du format SWAM, dont \texttt{MESSAGE\_TYPE}, \texttt{TRANSACTION\_AMOUNT}, \texttt{TRANSACTION\_CURRENCY}, \texttt{ISSUING\_BANK}, \texttt{CARD\_TYPE}, \texttt{AUTHORIZATION\_CODE}, \texttt{REJECT\_CODE} et \texttt{PRODUCT\_CODE}.
+
+    \item \textbf{ValidationResult} : Encapsule le résultat de la validation par le Job 2. Elle contient le statut (\texttt{VALID} ou \texttt{INVALID}), le code de rejet machine-readable (\texttt{rejectReason}) et l'horodatage de validation (\texttt{validatedAt}). Les codes de rejet incluent les règles métier HPS et les violations ISO (\texttt{ISO8583\_UNKNOWN\_MTI}, \texttt{ISO4217\_INVALID\_CURRENCY}, \texttt{ISO7812\_LUHN\_FAILED}).
+
+    \item \textbf{NormalizedTransaction} : Étend la \texttt{Transaction} avec les données normalisées par le Job 3 : dates converties en ISO 8601, montants en format décimal, métadonnées de traitement (\texttt{processedAt}, \texttt{sourceSystem}, \texttt{pipelineVersion}) et enrichissements ISO (\texttt{cardScheme}, \texttt{mtiName}, \texttt{currencyAlpha}, \texttt{mccDescription}).
+
+    \item \textbf{EnrichedTransaction} : Étend la \texttt{NormalizedTransaction} avec les données d'enrichissement métier du Job 4 : canal de paiement (\texttt{paymentChannel} : \texttt{SO\_CARTE} ou \texttt{SO\_MOBILE}), score de risque (\texttt{riskScore} : \texttt{HIGH}, \texttt{MEDIUM} ou \texttt{LOW}) et horodatage d'optimisation (\texttt{optimizedAt}).
+
+    \item \textbf{DLQRecord} : Représente un enregistrement rejeté routé vers \texttt{payments.dlq}. Il contient le motif d'erreur (\texttt{errorCode}), le type d'erreur (\texttt{errorType}), le job source (\texttt{sourceJob}) et l'horodatage de l'erreur. Le payload chiffré original n'est jamais inclus pour des raisons de sécurité.
+
+    \item \textbf{MedallionLayer} : Représente une couche de stockage MinIO (Bronze, Silver ou Gold). Elle encapsule le préfixe S3 (\texttt{prefix}), le bucket (\texttt{bucket = rt-payments}) et les méthodes d'écriture avec clé horodatée et UUID pour éviter les collisions.
+
+\end{itemize}
+
+\vspace{0.3cm}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{classeeee.png}
+  \caption{Diagramme de classes --- Entités du Pipeline de Streaming Temps Réel}
+  \label{fig:classes}
+\end{figure}
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{DATAMART.png}
+  \caption{DATAMART A COMPLETER}
+  \label{fig:datamart}
+\end{figure}
+\newpage
+
+% ============================================================
+\subsubsection{Diagramme de Séquence}
+\vspace{0.3cm}
+
+Le diagramme de séquence illustre le flux dynamique d'une transaction de paiement HPS à travers les quatre jobs Flink successifs. Il modélise les interactions temporelles entre les différents composants du pipeline --- du Producer jusqu'au Data Mart PostgreSQL --- en distinguant les trois blocs de traitement principaux via des fragments \texttt{alt}.
+
+\vspace{0.3cm}
+\textbf{Description des participants}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{Producer / Kafka Connect} : Publie les transactions chiffrées (payload Fernet) dans le topic \texttt{payments}.
+    \item \textbf{Kafka Broker} : Stocke et route les messages entre les jobs via les six topics du pipeline.
+    \item \textbf{Job 1 --- Décryption} : Déchiffre le payload Fernet et écrit l'enregistrement brut dans la couche Bronze de MinIO.
+    \item \textbf{Job 2 --- Validation} : Applique les 9 règles de validation et route les transactions invalides vers la DLQ.
+    \item \textbf{Job 3 --- Normalisation} : Convertit les dates en ISO 8601, normalise les montants et enrichit les données ISO.
+    \item \textbf{Job 4 --- Optimisation} : Déduplique par \texttt{AUTHORIZATION\_CODE}, calcule le score de risque et publie vers \texttt{payments.gold}.
+    \item \textbf{MinIO / Data Mart} : Stocke les données aux couches Bronze, Silver et Gold, et alimente la table \texttt{fact\_transactions}.
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Description des fragments \texttt{alt}}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{alt [Décryption réussie]} : Si le token Fernet est valide, le payload est déchiffré, écrit en Bronze et transmis à Job 2 via \texttt{payments.decrypted}. En cas d'échec (\texttt{INVALID\_FERNET\_TOKEN}), le message est routé vers \texttt{payments.dlq}.
+    \item \textbf{alt [Validation OK]} : Si les 9 règles sont respectées, la transaction est transmise à Job 3 via \texttt{payments.validated} avec \texttt{status=VALID}. En cas d'échec, un \texttt{rejectReason} machine-readable est ajouté et le message est routé vers \texttt{payments.dlq}.
+    \item \textbf{alt [Normalisation + Enrichissement + Optimisation]} : La transaction est normalisée et écrite en Silver, enrichie et dédupliquée par Job 4, puis publiée dans \texttt{payments.gold} avec \texttt{risk\_score} et \texttt{payment\_channel}. Le résultat final est écrit en Gold (MinIO) et inséré dans \texttt{fact\_transactions} (Data Mart PostgreSQL) via un \texttt{UPSERT}.
+\end{itemize}
+
+\vspace{0.3cm}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1\textwidth]{sequence.png}
+  \caption{Diagramme de séquence --- Traitement d'une transaction HPS à travers le pipeline}
+  \label{fig:sequence}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsubsection{Diagramme d'Activité}
+\vspace{0.3cm}
+
+Le diagramme d'activité modélise le flux décisionnel de la validation des transactions dans le Job 2. Il illustre les 9 règles de validation appliquées séquentiellement, en distinguant le chemin nominal vers \texttt{payments.validated} et les chemins d'erreur vers \texttt{payments.dlq} avec des codes de rejet machine-readable.
+\\[0.3cm]
+Cette représentation est particulièrement importante car la validation constitue le nœud central du pipeline : elle garantit que seules les transactions conformes aux exigences métier HPS et aux standards ISO bancaires progressent vers les couches Silver et Gold, tandis que les enregistrements défectueux sont isolés sans bloquer le flux principal.
+
+\vspace{0.3cm}
+\textbf{Description des étapes de validation}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{Règle 1 --- \texttt{MESSAGE\_TYPE}} : La règle vérifie que le champ est présent et qu'il contient exactement 4 chiffres décimaux. Un champ absent produit le code \texttt{MISSING\_MESSAGE\_TYPE} ; un format incorrect produit \texttt{INVALID\_MESSAGE\_TYPE\_FORMAT}.
+
+    \item \textbf{Règle 2 --- \texttt{TRANSACTION\_AMOUNT}} : La règle vérifie que le montant est présent, convertible en nombre flottant et strictement positif. Les codes de rejet associés sont \texttt{MISSING\_TRANSACTION\_AMOUNT}, \texttt{INVALID\_TRANSACTION\_AMOUNT\_FORMAT} et \texttt{TRANSACTION\_AMOUNT\_NOT\_POSITIVE}.
+
+    \item \textbf{Règles 3, 4 et 5 --- Champs obligatoires} : Les champs \texttt{TRANSACTION\_CURRENCY}, \texttt{ISSUING\_BANK} et \texttt{CARD\_TYPE} doivent être présents et non vides. Chaque absence produit le code \texttt{MISSING\_*} correspondant.
+
+    \item \textbf{Règle 6 --- \texttt{REJECT\_CODE}} : Le champ doit être vide ou absent. Un code de rejet non vide signifie que la transaction a déjà été refusée par la banque émettrice ; le code produit est \texttt{REJECTED\_BY\_BANK}.
+
+    \item \textbf{Règle 7 --- ISO 8583 --- MTI} : Le \texttt{MESSAGE\_TYPE} doit correspondre à un identifiant de type de message (MTI) reconnu par le standard ISO 8583. Un MTI inconnu produit le code \texttt{ISO8583\_UNKNOWN\_MTI}.
+
+    \item \textbf{Règle 8 --- ISO 4217 --- Devise} : Le code devise numérique \texttt{TRANSACTION\_CURRENCY} doit figurer dans le dictionnaire ISO 4217 (ex. : 504 = MAD, 840 = USD). Un code invalide produit \texttt{ISO4217\_INVALID\_CURRENCY}.
+
+    \item \textbf{Règle 9 --- ISO 7812 --- Luhn} : Le \texttt{CARD\_NUMBER} (après suppression des éventuels masques \texttt{*}) doit passer la vérification mod-10 de l'algorithme de Luhn. Un échec produit \texttt{ISO7812\_LUHN\_FAILED}. La vérification n'est appliquée que si le numéro comporte au moins 12 chiffres réels.
+
+    \item \textbf{Résultat nominal} : Si les 9 règles sont toutes respectées, la transaction est émise vers le topic \texttt{payments.validated} pour être traitée par le Job 3.
+
+    \item \textbf{Résultat alternatif} : À chaque règle, un échec entraîne l'émission immédiate vers \texttt{payments.dlq} via un \texttt{OutputTag} Flink, avec un code de rejet structuré lisible par machine.
+\end{itemize}
+
+\vspace{0.3cm}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{activite.png}
+  \caption{Diagramme d'activité --- Flux de validation des 9 règles dans le Job 2}
+  \label{fig:activite}
+\end{figure}
+
+\newpage
+
+% ============================================================
+\subsubsection{Diagramme d'États}
+\vspace{0.3cm}
+
+Le diagramme d'états modélise le cycle de vie complet d'une transaction de paiement HPS depuis sa production jusqu'à son archivage final. Il distingue le chemin nominal à travers les 8 états successifs et le chemin d'erreur vers l'état Rejeté, pouvant survenir aux étapes de décryption et de validation.
+\\[0.3cm]
+Cette vue est complémentaire au diagramme de séquence : là où le diagramme de séquence décrit les interactions entre composants, le diagramme d'états décrit l'évolution interne d'un objet \texttt{Transaction} tout au long de son cycle de vie dans le pipeline.
+
+\vspace{0.3cm}
+\textbf{Description des états}
+
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{Produit} : État initial. La transaction est lue depuis la source CSV ou PostgreSQL par le Producer Python. Les données sont au format brut SWAM avec leurs 95 champs originaux.
+
+    \item \textbf{Chiffré} : Le Producer applique le chiffrement symétrique Fernet (AES-128-CBC + HMAC-SHA256) sur le payload de la transaction, et encapsule le résultat dans une enveloppe JSON CDC (\texttt{eventId}, \texttt{table}, \texttt{operation}, \texttt{payload}, \texttt{timestamp}).
+
+    \item \textbf{Publié} : L'enveloppe chiffrée est publiée dans le topic Kafka \texttt{payments} avec une rétention de 24 heures. Seul le payload chiffré transite sur le réseau ; les données en clair ne sont jamais exposées sur le bus de messages.
+
+    \item \textbf{Décrypté} : Le Job 1 déchiffre le payload Fernet, reconstitue les champs de transaction et écrit l'enregistrement brut dans la couche Bronze de MinIO (\texttt{rt-payments/bronze/}). Un bloc \texttt{\_meta} avec l'horodatage \texttt{decryptedAt} est ajouté. La transition vers l'état \textit{Rejeté} se produit en cas d'échec Fernet (\texttt{INVALID\_FERNET\_TOKEN}).
+
+    \item \textbf{Validé} : Le Job 2 applique les 9 règles de validation (6 règles métier HPS + 3 règles ISO 8583/4217/7812). La transaction atteint cet état uniquement si elle respecte toutes les règles. La transition vers \textit{Rejeté} se produit à la première règle non respectée, avec un code de rejet structuré.
+
+    \item \textbf{Normalisé} : Le Job 3 convertit les dates au format ISO 8601, normalise les montants en décimaux et enrichit l'enregistrement avec les métadonnées ISO (\texttt{card\_scheme}, \texttt{mcc\_description}, \texttt{currency\_alpha}, \texttt{currency\_minor\_units}). L'enregistrement enrichi est écrit dans la couche Silver de MinIO (\texttt{rt-payments/silver/}).
+
+    \item \textbf{Optimisé} : Le Job 4 déduplique la transaction par \texttt{AUTHORIZATION\_CODE} via un \texttt{ValueState} Flink persistant, détermine le canal de paiement (\texttt{SO\_CARTE} ou \texttt{SO\_MOBILE}) selon le \texttt{PRODUCT\_CODE}, et calcule le score de risque (\texttt{HIGH}, \texttt{MEDIUM} ou \texttt{LOW}). L'enregistrement final est écrit dans la couche Gold de MinIO (\texttt{rt-payments/gold/}) et publié dans \texttt{payments.gold}.
+
+    \item \textbf{Synchronisé} : Le service \texttt{gold-sink} consomme le topic \texttt{payments.gold}, aplatit le sous-objet \texttt{transaction} en 18 colonnes et effectue un \texttt{UPSERT ON CONFLICT (authorization\_code)} dans la table \texttt{fact\_transactions} du Data Mart PostgreSQL. C'est l'état final du chemin nominal.
+
+    \item \textbf{Rejeté} : État terminal alternatif. La transaction est routée vers \texttt{payments.dlq} avec un code d'erreur structuré et une rétention de 72 heures, permettant aux équipes d'analyser les échecs et de rejouer les enregistrements corrigés si nécessaire.
+\end{itemize}
+
+\vspace{0.3cm}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=1.1\textwidth]{etats.png}
+  \caption{Diagramme d'états --- Cycle de vie d'une transaction HPS dans le pipeline}
+  \label{fig:etats}
+\end{figure}
+
+
+\newpage
+
+% ============================================================
+\subsection*{Conclusion}
+\phantomsection
+\addcontentsline{toc}{subsection}{Conclusion}
+\vspace{0.5cm}
+
+Ce chapitre a permis de poser les bases analytiques et conceptuelles de la plateforme de streaming temps réel développée pour HPS Group. L'analyse des besoins a mis en évidence deux catégories d'exigences complémentaires et indissociables.
+\\[0.3cm]
+Les besoins non fonctionnels ont défini le cadre de qualité du système : une latence inférieure à 5 secondes, une disponibilité continue grâce au checkpointing Flink en mode \texttt{EXACTLY\_ONCE}, une sécurité renforcée par le chiffrement Fernet (AES-128-CBC + HMAC-SHA256) et le masquage PCI-DSS des numéros de carte, ainsi qu'une architecture scalable et maintenable via Kubernetes et Terraform.
+\\[0.3cm]
+Les besoins fonctionnels ont décrit précisément les capacités attendues de chaque couche : l'ingestion sécurisée via Kafka Connect avec Debezium CDC, le traitement en 4 jobs Flink successifs appliquant 9 règles de validation (6 règles métier HPS et 3 règles de conformité ISO 8583/4217/7812), le stockage structuré dans l'architecture Medallion Bronze/Silver/Gold de MinIO, et la couche analytique Data Mart PostgreSQL alimentée en temps réel.
+\\[0.3cm]
+La phase de conception a permis de modéliser le système à travers cinq diagrammes UML complémentaires. Le \textbf{diagramme de cas d'utilisation} a identifié les trois acteurs principaux --- Data Engineer, Administrateur et Data Analyste --- et leurs interactions avec les 12 fonctionnalités du système, en couvrant l'ingestion, le traitement, le stockage et la visualisation. Le \textbf{diagramme de classes} a structuré les entités manipulées tout au long du pipeline, depuis la \texttt{KafkaEnvelope} initiale jusqu'à l'\texttt{EnrichedTransaction} finale publiée dans \texttt{payments.gold}, en incluant la classe abstraite \texttt{FlinkJob} et ses quatre sous-classes concrètes. Le \textbf{diagramme de séquence} a modélisé le flux dynamique d'une transaction à travers les quatre jobs Flink, avec les fragments \texttt{alt} couvrant les cas nominaux et les cas d'erreur routés vers la DLQ.
+\\[0.3cm]
+Le \textbf{diagramme d'activité} a détaillé le flux décisionnel des 9 règles de validation du Job 2, en illustrant les chemins d'erreur vers \texttt{payments.dlq} avec leurs codes de rejet machine-readable (dont \texttt{ISO8583\_UNKNOWN\_MTI}, \texttt{ISO4217\_INVALID\_CURRENCY} et \texttt{ISO7812\_LUHN\_FAILED}). Le \textbf{diagramme d'états} a modélisé le cycle de vie complet d'une transaction à travers ses 9 états successifs, du stade \textit{Produit} au stade \textit{Synchronisé} dans le Data Mart, avec le chemin alternatif \textit{Rejeté} vers la DLQ.
+\\[0.3cm]
+Ces analyses et modèles constituent la référence technique pour le chapitre suivant, qui présentera les choix technologiques et l'étude comparative des solutions disponibles.
+
+\newpage

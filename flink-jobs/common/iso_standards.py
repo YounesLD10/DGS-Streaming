@@ -1,14 +1,14 @@
 """
-ISO standards reference data and helpers for HPS pipeline validation/enrichment.
+Reference data and helpers for SWAM pipeline validation/enrichment.
 
 Covers:
-  ISO 8583  — Message Type Indicators (MTI)
-  ISO 4217  — Currency Codes
-  ISO 18245 — Merchant Category Codes (MCC)
-  ISO 7812  — Card number validation (Luhn algorithm)
+  HPS MTI whitelist  — 15 known 1xxx-series MTIs (subset of ISO 8583; not full standard)
+  Currency whitelist — 23 MENA/major currencies (subset of ISO 4217; not full standard)
+  ISO 18245          — Merchant Category Codes (MCC)
+  ISO 7812           — Card number validation (Luhn algorithm)
 """
 
-# ── ISO 8583 — Message Type Indicators ──────────────────────────────────────
+# ── HPS MTI whitelist — 15 known 1xxx-series MTIs (not full ISO 8583) ───────
 ISO8583_MTI = {
     "1100": "Authorization Request",
     "1110": "Authorization Response",
@@ -27,7 +27,7 @@ ISO8583_MTI = {
     "1800": "Network Management Request",
 }
 
-# ── ISO 4217 — Currency Codes ────────────────────────────────────────────────
+# ── Currency whitelist — 23 MENA/major currencies (not full ISO 4217) ────────
 ISO4217 = {
     "504": {"alpha": "MAD", "minorUnits": 2},
     "840": {"alpha": "USD", "minorUnits": 2},

@@ -1,0 +1,70 @@
+% ============================================================================
+% pageGarde.tex — page de garde (TikZ), reproduction du template EMSI
+% ============================================================================
+\begin{titlepage}
+\thispagestyle{empty}
+\newgeometry{margin=0cm}
+
+\begin{tikzpicture}[remember picture, overlay, x=1cm, y=1cm]
+  % Bandeau triangulaire vert -- haut gauche
+  \fill[EMSIvert] (current page.north west) -- ++(7,0) -- ++(0,-4.5) -- cycle;
+  % Bandeau triangulaire vert -- bas droite
+  \fill[EMSIvert] (current page.south east) -- ++(-7,0) -- ++(0,4.5) -- cycle;
+
+  % Logo EMSI -- haut droite
+  \node[anchor=north east] at ($(current page.north east)+(-1.3,-1.2)$)
+    {\includegraphics[width=4.2cm]{figures/emsi-logo.png}};
+\end{tikzpicture}
+
+\vspace{5.2cm}
+
+\begin{center}
+{\headfont\bfseries\Large Projet de Fin d'Annee}
+
+\vspace{0.4cm}
+{\headfont\large 5\textsuperscript{eme} Annee --- Annee universitaire 2025 / 2026}
+
+\vspace{1.2cm}
+\noindent\rule{0.85\textwidth}{0.8pt}
+
+\vspace{1.6cm}
+{\headfont\bfseries\fontsize{22}{26}\selectfont
+Conception et Realisation d'un PoC de Streaming\\[0.2cm]
+Temps Reel pour la Detection de Fraude Bancaire}
+
+\vspace{1.6cm}
+\noindent\rule{0.85\textwidth}{0.8pt}
+\end{center}
+
+\vfill
+
+\begin{minipage}[t]{0.52\textwidth}
+\setlength{\fboxsep}{0.45cm}
+\colorbox{EMSIvertClair}{%
+  \begin{minipage}{\dimexpr\linewidth-0.9cm}
+  \color{EMSIvert}\headfont
+  \textbf{Realise par :}\\ Asmae ABIDINE
+  \vspace{0.35cm}\\
+  \textbf{Encadrant Professionnel :}\\ M. Haitam BOUTAFI \textperiodcentered\ Ingenieur \textperiodcentered\ HPS Group
+  \vspace{0.35cm}\\
+  \textbf{Encadrant Pedagogique :}\\ \acompleter{[Prenom NOM \textperiodcentered\ Grade]}
+  \end{minipage}%
+}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.40\textwidth}
+\setlength{\fboxsep}{0.45cm}
+\fbox{%
+  \begin{minipage}{\dimexpr\linewidth-0.9cm}
+  \headfont\centering
+  \textbf{Organisme d'accueil :}\\[0.3cm]
+  \includegraphics[width=3.2cm]{figures/hps-logo.png}\\[0.3cm]
+  HPS Group Morocco
+  \end{minipage}%
+}
+\end{minipage}
+
+\vspace{1.2cm}
+
+\restoregeometry
+\end{titlepage}

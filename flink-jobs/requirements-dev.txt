@@ -1,0 +1,3 @@
+pytest>=7.0
+pytest-mock>=3.0
+duckdb>=1.0.0  # scripts/duckdb_analytics_demo.py — standalone Gold-layer analytics demo, not a runtime pipeline dependency

@@ -1,0 +1,40 @@
+%%{init: {'theme': 'neutral'}}%%
+flowchart TB
+    subgraph TARGETS["Scrape targets"]
+        JM["flink-jobmanager :9249\n(static target)"]
+        TM["flink-taskmanager :9249\n(kubernetes_sd_configs pod discovery\n+ RBAC + relabel on component=taskmanager)"]
+        MN["MinIO\n/minio/v2/metrics/cluster"]
+        EXP["hps_exporter.py — :8888/metrics\n(custom Python HTTPServer)"]
+    end
+
+    subgraph EXP_INTERNALS["Business metrics exporter internals"]
+        EK["Kafka consumer\n→ hps_payments_total{stage,topic}"]
+        EM["MinIO client\n→ hps_minio_objects{layer}"]
+        EP["Postgres query\n→ hps_datamart_total\n→ hps_risk_score_total{risk}\n→ hps_payment_channel_total{channel}"]
+        EK & EM & EP --> EXP
+    end
+
+    PROM["Prometheus\n(prometheus-config ConfigMap\nscrape_configs)"]
+
+    subgraph DASH["Grafana — dashboard 'HPS Streaming Pipeline' (7 panels)"]
+        ROW1["Stat: Payments Processed · DLQ Rejected\nFlink Jobs Running · Last Checkpoint (ms)"]
+        ROW2["Stat: Bronze / Silver / Gold object counts"]
+        ROW3["Timeseries: Pipeline Stage Flow\n(5 series — hps_payments_total per stage)"]
+    end
+
+    JM --> PROM
+    TM --> PROM
+    MN --> PROM
+    EXP --> PROM
+    PROM -- "PromQL" --> ROW1
+    PROM -- "PromQL" --> ROW2
+    PROM -- "PromQL" --> ROW3
+
+    classDef target fill:#e2ecfd,stroke:#2c5fa8,color:#000
+    classDef exp fill:#fff3cd,stroke:#a67c00,color:#000
+    classDef prom fill:#fde2e2,stroke:#c0392b,color:#000
+    classDef graf fill:#e6f4ea,stroke:#2e7d32,color:#000
+    class JM,TM,MN target
+    class EK,EM,EP,EXP exp
+    class PROM prom
+    class ROW1,ROW2,ROW3 graf

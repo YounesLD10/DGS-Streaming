@@ -1,0 +1,294 @@
+% ============================================================
+% CHAPITRE 1 : Contexte Général du Projet
+% Projet : Pipeline de Streaming Temps Réel --- HPS Group
+% Auteure : Asmae ABIDINE
+% ============================================================
+
+{\begin{center}\includegraphics[width=0.6\textwidth]{chapter1.png}\end{center}}
+
+\mysection{Chapitre 1}{Contexte Général du Projet}
+
+\vspace{0.5cm}
+\flushleft
+
+\subsection*{Introduction}
+\phantomsection
+\addcontentsline{toc}{subsection}{Introduction}
+\vspace{0.5cm}
+Dans ce premier chapitre, nous allons explorer en profondeur l'univers de notre organisme d'accueil, \textbf{SWAM (Switch Al Maghrib)}. Nous commencerons par une présentation détaillée de cette entreprise, en mettant en avant son secteur d'activité, son positionnement dans l'écosystème des paiements électroniques au Maroc, ainsi que sa structure organisationnelle à travers son organigramme et sa fiche technique.
+\\[0.3cm]
+Par la suite, nous nous intéresserons au contexte général du projet, en exposant la problématique à laquelle SWAM fait face, les objectifs fixés pour y répondre, ainsi qu'une étude de l'existant permettant de comprendre les limites du système actuel et de justifier la solution proposée.
+\\[0.3cm]
+Enfin, nous présenterons la conduite du projet, en détaillant la méthodologie agile adoptée, les outils mobilisés et la planification générale des travaux réalisés tout au long de ce stage de six mois.
+\\[0.3cm]
+Cette approche globale offrira ainsi une meilleure compréhension du contexte général de notre expérience, en mettant en lumière les éléments structurants qui ont marqué notre parcours et contribué à enrichir notre apprentissage professionnel.
+\clearpage
+\newpage
+
+%=============================================================
+\subsection{Organisme d'Accueil}
+%=============================================================
+\vspace{0.5cm}
+
+\subsubsection{Présentation de SWAM}
+\vspace{0.3cm}
+SWAM (Switch Al Maghrib) est une entreprise marocaine spécialisée dans le \textbf{switching de paiements électroniques}. Son rôle central est d'assurer le routage et l'autorisation des transactions de paiement entre les différents acteurs du système financier national : commerçants, banques émetteurs, porteurs de cartes et opérateurs de paiement mobile.
+\\[0.3cm]
+Le switching désigne le processus par lequel chaque transaction initiée par un client est analysée, routée vers la banque destinataire appropriée et autorisée ou refusée en moins de deux secondes. SWAM se positionne ainsi comme un acteur clé et critique de l'infrastructure nationale des paiements, traitant quotidiennement des millions de transactions provenant de deux canaux principaux :
+
+\begin{itemize}
+    \item \textbf{SO Carte (Switching Object Carte)} : transactions par carte bancaire (CB, Visa, Mastercard, CMI)
+    \item \textbf{SO Mobile} : transactions par paiement mobile (applications bancaires, portefeuilles électroniques)
+\end{itemize}
+
+\begin{center}
+  \includegraphics[width=0.5\textwidth]{swam_logo.jpg}
+\end{center}
+
+\subsubsection{Secteur d'Activité}
+\vspace{0.3cm}
+SWAM évolue dans le secteur des \textbf{paiements électroniques et de la monétique}, un domaine en forte croissance au Maroc, porté par la digitalisation des échanges financiers et les politiques d'inclusion financière menées par Bank Al-Maghrib.
+\\[0.3cm]
+Les principaux domaines d'intervention de SWAM couvrent :
+\\[0.2cm]
+\textbf{Switching et routage des transactions :}\\
+SWAM assure le routage en temps réel de chaque transaction de paiement vers la banque émettrice ou acquéreuse concernée, en garantissant une disponibilité de service 24h/24 et 7j/7, avec des temps de réponse inférieurs à deux secondes.
+\vspace{0.3cm}\\
+\textbf{Sécurité et prévention de la fraude :}\\
+SWAM implémente des mécanismes de contrôle et de surveillance des transactions afin de détecter et de prévenir les tentatives de fraude, en conformité avec les exigences de Bank Al-Maghrib et les standards internationaux PCI-DSS.
+\vspace{0.3cm}\\
+\textbf{Interopérabilité des réseaux de paiement :}\\
+SWAM garantit l'interopérabilité entre les différents réseaux de paiement nationaux et internationaux, permettant aux porteurs de cartes marocains d'effectuer des transactions auprès de tout commerçant affilié, quelle que soit leur banque.
+\vspace{0.3cm}\\
+\textbf{Traitement des données de paiement :}\\
+SWAM collecte, traite et stocke les données générées par chaque transaction, dans le respect des exigences réglementaires en matière de conservation et de traçabilité des données financières.
+
+\newpage
+\subsubsection{Fiche Technique et Organigramme}
+\vspace{0.3cm}
+
+\begin{table}[h!]
+\centering
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Champ} & \textbf{Information} \\
+\hline
+Raison sociale &
+  HPS Group (Hightech Payment Systems) \\
+\hline
+Secteur d'activité &
+  Paiements électroniques / Monétique \\
+\hline
+Siège social & Casablanca, Maroc \\
+\hline
+Activité principale &
+  Switching et routage de paiements \\
+\hline
+Année de fondation & 1995 \\
+\hline
+Effectif & $\sim$500 employés \\
+\hline
+Site web & www.hps-worldwide.com \\
+\hline
+\end{tabular}
+\caption{Fiche Technique de HPS Group}
+\label{tab:swam}
+\end{table}
+
+\vspace{0.5cm}
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.7\textwidth]{organigramme_swam.png}
+  \caption{Organigramme de SWAM}
+  \label{fig:orga}
+\end{figure}
+
+\newpage
+
+%=============================================================
+\subsection{Contexte Général du Projet}
+%=============================================================
+\vspace{0.5cm}
+
+\subsubsection{Problématique}
+\vspace{0.3cm}
+Le système de traitement des données en place chez SWAM repose sur un \textbf{pipeline batch nocturne} déployé sur Microsoft Azure. Ce pipeline collecte l'ensemble des transactions de la journée pour les traiter en une seule passe chaque nuit à 23h00, produisant ses résultats le lendemain matin entre 06h00 et 08h00.
+\\[0.3cm]
+Ce modèle de traitement génère une \textbf{latence critique de 8 à 16 heures} entre l'occurrence d'un événement et sa détection. Dans le domaine des paiements électroniques, cette latence pose un problème fondamental : une transaction frauduleuse survenant à 14h00 est autorisée instantanément par le système de switching, mais n'est identifiée comme suspecte que le lendemain matin. La transaction est alors irréversible et les fonds sont définitivement perdus.
+\\[0.3cm]
+Face à ces constats, la question centrale est la suivante :
+\\[0.2cm]
+\begin{center}
+\textit{Comment concevoir une plateforme de traitement de données temps réel, 100\% open source, capable de détecter les comportements frauduleux avant l'autorisation des transactions, tout en coexistant avec le pipeline batch Azure existant sans l'impacter ?}
+\end{center}
+\\[0.3cm]
+Les principales limites identifiées du système actuel sont résumées dans le tableau suivant :
+
+\vspace{0.3cm}
+\renewcommand{\arraystretch}{1.3}
+\begin{table}[h!]
+\centering
+\begin{tabularx}{\textwidth}{@{} l X @{}}
+\toprule
+\textbf{Limite identifiée} & \textbf{Impact concret} \\
+\midrule
+Latence de 8 à 16 heures & Fraude autorisée et irréversible avant détection \\
+\rowcolor{gray!6}
+Traitement batch nocturne & Aucune visibilité sur les transactions en cours de journée \\
+Absence d'API temps réel & Impossible d'exposer des données live aux partenaires \\
+\rowcolor{gray!6}
+Stack Azure propriétaire & Coûts élevés, dépendance fournisseur, flexibilité limitée \\
+Pas de monitoring temps réel & Incidents détectés avec retard, SLA difficiles à mesurer \\
+\rowcolor{gray!6}
+Pas de scoring ML en ligne & Modèles de détection tournent offline, résultats trop tardifs \\
+\bottomrule
+\end{tabularx}
+\caption{Limites du système de traitement actuel}
+\label{tab:limites}
+\end{table}
+
+\newpage
+\subsubsection{Objectifs du Projet}
+\vspace{0.3cm}
+L'objectif principal de ce projet est de concevoir et de déployer une \textbf{plateforme de données streaming temps réel, 100\% open source}, permettant de traiter chaque transaction de paiement en moins de 5 secondes et de détecter les comportements frauduleux avant leur autorisation.
+\\[0.3cm]
+Les objectifs spécifiques sont les suivants :
+
+\begin{itemize}
+    \item \textbf{Réduire la latence de détection} : passer de 8 à 16 heures à moins de 5 secondes.
+    \item \textbf{Implémenter 9 règles de validation} : appliquer les règles métier HPS et les standards bancaires ISO~8583, ISO~4217 et ISO~7812 (Luhn) sur chaque transaction en temps réel.
+    \item \textbf{Calculer un score de risque} : attribuer un score \texttt{HIGH}, \texttt{MEDIUM} ou \texttt{LOW} à chaque transaction selon les règles métier HPS.
+    \item \textbf{Dédupliquer les transactions} : éliminer les doublons par \texttt{AUTHORIZATION\_CODE} via le mécanisme Flink \texttt{KeyedState}.
+    \item \textbf{Persister les données Gold} : stocker les transactions enrichies dans PostgreSQL via un consumer Python \texttt{gold-sink}.
+    \item \textbf{Assurer la coexistence sans interférence} : déployer le nouveau pipeline en parallèle du pipeline batch Azure existant, avec une isolation totale garantissant zéro impact sur les traitements nocturnes en production.
+    \item \textbf{Garantir la conformité réglementaire} : assurer la traçabilité complète des transactions, la rétention des données sur 7 ans et la conformité aux normes PCI-DSS imposées par Bank Al-Maghrib.
+    \item \textbf{Mettre en place une observabilité complète} : déployer un système de monitoring temps réel couvrant l'ensemble du pipeline de données.
+\end{itemize}
+
+\subsubsection{Étude de l'Existant}
+\vspace{0.3cm}
+Avant de concevoir la solution cible, une analyse approfondie du système existant a été conduite afin d'en comprendre le fonctionnement, les forces et les limites.
+\\[0.3cm]
+\textbf{Architecture actuelle :}\\
+Le pipeline batch en place suit le flux suivant :
+
+\vspace{0.2cm}
+\begin{center}
+\texttt{Base On-Premise $\rightarrow$ SFTP (nuit) $\rightarrow$ Azure Data Lake (Bronze) $\rightarrow$ Spark on AKS $\rightarrow$ Silver $\rightarrow$ Gold $\rightarrow$ Power BI}
+\end{center}
+\vspace{0.2cm}
+
+Ce pipeline produit des rapports analytiques de qualité, mais uniquement disponibles le lendemain matin. Il constitue un actif précieux que le projet ne doit en aucun cas modifier ou perturber.
+\\[0.3cm]
+\textbf{Points forts du système existant :}
+\begin{itemize}
+    \item Architecture Medallion (Bronze / Silver / Gold) déjà en place et maîtrisée
+    \item Qualité des données garantie par les transformations Spark
+    \item Intégration Power BI opérationnelle pour le reporting
+    \item Infrastructure Azure AKS disponible et fonctionnelle
+\end{itemize}
+
+\textbf{Points faibles justifiant la solution proposée :}
+\begin{itemize}
+    \item Latence incompatible avec les exigences de détection de fraude en temps réel
+    \item Aucun mécanisme d'alerte ou de réaction immédiate en cas d'anomalie
+    \item Dépendance totale à des services Azure propriétaires
+    \item Absence d'APIs temps réel pour les applications partenaires
+\end{itemize}
+
+\newpage
+
+%=============================================================
+\subsection{Conduite du Projet}
+%=============================================================
+\vspace{0.5cm}
+
+\subsubsection{Méthodologie}
+\vspace{0.3cm}
+Pour mener à bien ce projet, la méthodologie \textbf{Scrum} a été adoptée. Cette approche agile, organisée en sprints d'une semaine, permet d'itérer rapidement, de valider chaque livrable de manière incrémentale et de s'adapter aux contraintes et imprévus rencontrés en cours de réalisation.
+\\[0.3cm]
+Chaque sprint suit un cycle structuré : planification en début de semaine, développement et implémentation, revue des livrables en fin de sprint, et rétrospective pour améliorer le processus. Cette organisation garantit une visibilité permanente sur l'avancement du projet et facilite la communication avec l'encadrant.
+
+\vspace{0.5cm}
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.85\textwidth]{scrum.png}
+  \caption{Méthodologie Scrum --- Cycle itératif en 5 sprints}
+  \label{fig:scrum}
+\end{figure}
+
+\newpage
+\subsubsection{Outils}
+\vspace{0.3cm}
+La réalisation de ce projet s'appuie sur un ensemble d'outils couvrant l'infrastructure, le traitement des données, la sécurité et le monitoring :
+
+\vspace{0.3cm}
+\renewcommand{\arraystretch}{1.3}
+\begin{table}[h!]
+\centering
+\begin{tabularx}{\textwidth}{@{} l l X @{}}
+\toprule
+\textbf{Catégorie} & \textbf{Outil} & \textbf{Rôle} \\
+\midrule
+Ingestion & Debezium CDC & Capture des changements PostgreSQL en temps réel (WAL) \\
+\rowcolor{gray!6}
+Event broker & Apache Kafka & Transport et distribution des événements de paiement (6 topics) \\
+Stream processing & Apache Flink & Traitement temps réel, validation ISO, scoring risque, déduplication \\
+\rowcolor{gray!6}
+Stockage objet & MinIO & Stockage Bronze / Silver / Gold (architecture Medallion) \\
+Persistance & PostgreSQL & Stockage relationnel des données Gold via table fact\_transactions \\
+\rowcolor{gray!6}
+Monitoring & Prometheus + Grafana & Métriques, dashboards temps réel \\
+Orchestration K8s & Strimzi & Opérateur Kubernetes pour Kafka \\
+\rowcolor{gray!6}
+Infrastructure & Kubernetes + Terraform & Déploiement conteneurisé, Infrastructure as Code \\
+IDE & VS Code & Environnement de développement \\
+\rowcolor{gray!6}
+Versioning & Git & Gestion du code source \\
+Langage & Python 3.12 & Jobs Flink, producer, consumer \\
+\bottomrule
+\end{tabularx}
+\caption{Outils utilisés dans le cadre du projet}
+\label{tab:outils}
+\end{table}
+
+\newpage
+\subsubsection{Planification}
+\vspace{0.3cm}
+La planification du projet a été établie sous forme d'un diagramme de Gantt couvrant les cinq sprints du Proof of Concept, organisés selon les phases suivantes :
+
+\begin{itemize}
+    \item \textbf{Sprint 1} : Infrastructure Kubernetes (Minikube, Terraform, Kafka KRaft, MinIO)
+    \item \textbf{Sprint 2} : Ingestion (Debezium CDC, 6 topics Kafka, couche Bronze)
+    \item \textbf{Sprint 3} : Traitement Flink (4 jobs PyFlink, validation ISO, normalisation, scoring risque)
+    \item \textbf{Sprint 4} : Persistance et monitoring (gold-sink PostgreSQL, Prometheus, Grafana)
+    \item \textbf{Sprint 5} : Tests end-to-end, validation pipeline, rapport
+\end{itemize}
+
+\vspace{0.3cm}
+\begin{figure}[h!]
+  \centering
+  \hspace*{-2cm}
+\includegraphics[width=1.25\textwidth]{gantt.png}  \caption{Diagramme de Gantt — Planification du PoC Streaming}
+  \label{fig:gantt}
+\end{figure}
+
+\newpage
+
+%=============================================================
+\subsection*{Conclusion}
+\phantomsection
+\addcontentsline{toc}{subsection}{Conclusion}
+%=============================================================
+\vspace{0.5cm}
+Ce premier chapitre a permis de poser les bases du contexte général de notre projet de fin d'études, réalisé au sein de \textbf{SWAM (Switch Al Maghrib)}.
+\\[0.2cm]
+Nous avons présenté l'organisme d'accueil, son secteur d'activité dans le switching de paiements électroniques, ainsi que sa structure organisationnelle. Nous avons ensuite exposé la problématique centrale du projet : un pipeline batch nocturne générant une latence de détection de fraude de 8 à 16 heures, incompatible avec les exigences d'un système de paiement moderne. L'étude de l'existant a permis d'identifier les forces du système actuel à préserver et les limites justifiant la solution proposée.
+\\[0.2cm]
+Les objectifs du projet ont été définis : concevoir et déployer une plateforme de données streaming temps réel, 100\% open source, capable de traiter chaque transaction en moins de 5 secondes et de détecter les fraudes avant leur autorisation.
+\\[0.2cm]
+Enfin, la méthodologie Scrum, les outils retenus et la planification en cinq sprints ont été présentés, offrant un cadre structuré et agile pour mener à bien ce projet.
+\\[0.2cm]
+Ce chapitre pose ainsi les bases nécessaires pour aborder l'analyse fonctionnelle et la conception détaillée de la plateforme dans le chapitre suivant.
+\newpage

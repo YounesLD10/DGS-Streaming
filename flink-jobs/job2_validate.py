@@ -47,10 +47,7 @@ from pyflink.datastream import (
     StreamExecutionEnvironment,
 )
 from pyflink.datastream.connectors.kafka import (
-    DeliveryGuarantee,
     KafkaOffsetsInitializer,
-    KafkaRecordSerializationSchema,
-    KafkaSink,
     KafkaSource,
 )
 from pyflink.datastream.functions import ProcessFunction
@@ -62,7 +59,8 @@ from common.config import (
     TOPIC_DLQ,
     TOPIC_VALIDATED,
 )
-from common.iso_standards import is_valid_currency, is_valid_mti, luhn_check
+from common.iso_standards import is_valid_currency, is_valid_mti, luhn_check, mask_pan
+from common.kafka_utils import kafka_sink as _kafka_sink
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,7 +83,7 @@ def _validate_transaction(tx: dict) -> tuple[bool, str]:
 
     Applies 9 rules in order (rules ①–⑥ structural, ⑦–⑨ ISO standards).
     Reject reason uses the format RULE_CODE so downstream consumers
-    can categorise failures without string parsing.
+    can categories failures without string parsing.
     """
     # ① MESSAGE_TYPE: not null, exactly 4 decimal digits
     msg_type = str(tx.get("MESSAGE_TYPE", "")).strip()
@@ -121,19 +119,21 @@ def _validate_transaction(tx: dict) -> tuple[bool, str]:
     if str(tx.get("REJECT_CODE", "")).strip():
         return False, "REJECTED_BY_BANK"
 
-    # ⑦ ISO 8583 — MTI must be a known message type
+    # ⑦ HPS MTI whitelist — validates against 15 known 1xxx-series MTIs (not full ISO 8583)
     if msg_type and not is_valid_mti(msg_type):
         return False, "ISO8583_UNKNOWN_MTI"
 
-    # ⑧ ISO 4217 — Currency must be in the dictionary
+    # ⑧ Currency whitelist — validates against 23 MENA/major currencies (not full ISO 4217)
     currency = str(tx.get("TRANSACTION_CURRENCY", "")).strip()
     if currency and not is_valid_currency(currency):
         return False, "ISO4217_INVALID_CURRENCY"
 
     # ⑨ ISO 7812 — Luhn check on CARD_NUMBER
-    pan = str(tx.get("CARD_NUMBER", "")).replace("*", "").strip()
-    real_digits = [c for c in pan if c.isdigit()]
-    if len(real_digits) >= 12 and not luhn_check("".join(real_digits)):
+    # With unmasked PANs flowing from producer (masking removed pre-encryption),
+    # run Luhn directly on digit characters — no asterisk stripping needed.
+    pan = str(tx.get("CARD_NUMBER", "")).strip()
+    pan_digits = "".join(c for c in pan if c.isdigit())
+    if len(pan_digits) >= 12 and not luhn_check(pan_digits):
         return False, "ISO7812_LUHN_FAILED"
 
     return True, ""
@@ -168,7 +168,15 @@ class ValidateFn(ProcessFunction):
                     "INVALID eventId=%s reason=%s",
                     record.get("eventId"), reason,
                 )
-                yield DLQ_TAG, json.dumps(record, ensure_ascii=False)
+                # Mask PAN in DLQ output (first 6 + last 4) — the full unmasked
+                # PAN must not be stored in the dead-letter queue.
+                dlq_record = dict(record)
+                if isinstance(dlq_record.get("transaction"), dict):
+                    dlq_tx = dict(dlq_record["transaction"])
+                    if "CARD_NUMBER" in dlq_tx:
+                        dlq_tx["CARD_NUMBER"] = mask_pan(str(dlq_tx["CARD_NUMBER"]))
+                    dlq_record["transaction"] = dlq_tx
+                yield DLQ_TAG, json.dumps(dlq_record, ensure_ascii=False)
 
         except Exception as exc:
             # Malformed records go to DLQ with an PARSE_ERROR reason
@@ -186,21 +194,7 @@ class ValidateFn(ProcessFunction):
             yield DLQ_TAG, json.dumps(dlq, ensure_ascii=False)
 
 
-# ── KafkaSink factory ──────────────────────────────────────────────────────────
-
-def _kafka_sink(topic: str) -> KafkaSink:
-    return (
-        KafkaSink.builder()
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
-        .set_record_serializer(
-            KafkaRecordSerializationSchema.builder()
-            .set_topic(topic)
-            .set_value_serialization_schema(SimpleStringSchema())
-            .build()
-        )
-        .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE)
-        .build()
-    )
+# _kafka_sink is imported from common.kafka_utils (shared factory)
 
 
 # ── Job entry point ────────────────────────────────────────────────────────────

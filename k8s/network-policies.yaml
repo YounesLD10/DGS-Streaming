@@ -82,3 +82,203 @@ spec:
           port: 9000
   policyTypes:
     - Ingress
+---
+# ── monitoring namespace — default deny ingress ───────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: monitoring
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# ── Allow in-cluster access to Prometheus (port 9090) and Grafana (port 3000) ─
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: monitoring
+spec:
+  podSelector: {}
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: 3000
+  policyTypes:
+    - Ingress
+---
+# ── Allow Prometheus to egress to scrape targets ──────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-egress-targets
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app: prometheus
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: flink
+      ports:
+        - protocol: TCP
+          port: 8081
+        - protocol: TCP
+          port: 9249
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+  policyTypes:
+    - Egress
+---
+# ── Allow Prometheus (monitoring ns) to scrape Kafka namespace metrics ─────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape-kafka
+  namespace: kafka
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9404
+        - protocol: TCP
+          port: 9092
+  policyTypes:
+    - Ingress
+---
+# ── Allow Prometheus (monitoring ns) to scrape Flink namespace metrics ─────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape-flink
+  namespace: flink
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9249
+        - protocol: TCP
+          port: 8081
+  policyTypes:
+    - Ingress
+---
+# ── Allow Prometheus (monitoring ns) to scrape MinIO namespace metrics ─────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape-minio
+  namespace: minio
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9000
+  policyTypes:
+    - Ingress
+---
+# ── kafka-connect namespace — default deny ingress ───────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: kafka-connect
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# ── Allow gold-sink to egress to Kafka (port 9092) ───────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gold-sink-to-kafka
+  namespace: kafka-connect
+spec:
+  podSelector:
+    matchLabels:
+      app: gold-sink
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+  policyTypes:
+    - Egress
+---
+# ── Allow gold-sink to reach postgres-datamart within kafka-connect ns ────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gold-sink-to-postgres
+  namespace: kafka-connect
+spec:
+  podSelector:
+    matchLabels:
+      app: gold-sink
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres-datamart
+      ports:
+        - protocol: TCP
+          port: 5432
+  policyTypes:
+    - Egress
+---
+# ── Allow ingress to postgres-datamart within kafka-connect ns ───────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres-admin
+  namespace: kafka-connect
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres-datamart
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kafka-connect
+      ports:
+        - protocol: TCP
+          port: 5432
+  policyTypes:
+    - Ingress
